@@ -448,7 +448,7 @@ export function deriveAttachmentNoticeState(state = {}) {
  * @param {number} [artifactRevision]
  * @param {string} [artifactLoadToken]
  * @param {string} [sessionKey]
- * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[] }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], initialAnnotate?: boolean }} [options]
  */
 export function createArtifactSdk(
   deriveQueueKey,
@@ -463,7 +463,7 @@ export function createArtifactSdk(
   function postArtifactMessage(type, payload = {}) {
     parent.postMessage({ type, ...payload, artifact_load_token: String(artifactLoadToken || "") }, "*");
   }
-  let annotationMode = true;
+  let annotationMode = options?.initialAnnotate !== undefined ? Boolean(options.initialAnnotate) : true;
   let hovered = null;
   let selected = null;
   let ignoreNextClick = false;
@@ -2254,7 +2254,18 @@ export function createArtifactSdk(
       highlightElement(selected);
     }
 
-    const rect = options.range ? options.range.getBoundingClientRect() : anchor.getBoundingClientRect();
+    const rect = options.range
+      ? options.range.getBoundingClientRect()
+      : options.point
+        ? {
+            left: options.point.x,
+            right: options.point.x,
+            top: options.point.y,
+            bottom: options.point.y,
+            width: 0,
+            height: 0,
+          }
+        : anchor.getBoundingClientRect();
     const card = document.createElement("div");
     card.className = "lavish-annotation-card";
     const nodeLabel = c.tag === "mermaid-node" ? c.target?.label || c.text || "" : "";
@@ -2578,6 +2589,8 @@ export function createArtifactSdk(
     (event) => {
       if (
         !annotationMode ||
+        event.ctrlKey ||
+        event.metaKey ||
         isLavishUi(event.target) ||
         isLavishAction(event.target) ||
         isInteractiveControl(event.target)
@@ -2590,6 +2603,32 @@ export function createArtifactSdk(
         return;
       }
       showAnnotationCard(event.target);
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "contextmenu",
+    (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (
+        !target ||
+        isLavishUi(target) ||
+        isLavishAction(target) ||
+        target.closest("input,textarea,[contenteditable]:not([contenteditable='false'])")
+      ) {
+        return;
+      }
+
+      const selection = document.getSelection();
+      const c = textSelectionContext(selection);
+      event.preventDefault();
+      event.stopPropagation();
+      if (c) {
+        showAnnotationCard(c.element, { context: c, range: c.range });
+      } else {
+        showAnnotationCard(target, { point: { x: event.clientX, y: event.clientY } });
+      }
     },
     true,
   );

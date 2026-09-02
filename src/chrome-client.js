@@ -180,7 +180,7 @@ const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
-let annotation = true;
+let annotation = sessionData.initialAnnotate !== undefined ? Boolean(sessionData.initialAnnotate) : true;
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";

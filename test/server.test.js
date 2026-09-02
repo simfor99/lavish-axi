@@ -29,6 +29,7 @@ import {
   resolveArtifactAsset,
   resolveDesignAssetPath,
   resolveIdleTimeoutMs,
+  resolveInitialAnnotateMode,
   resolveWatchTarget,
   serve,
 } from "../src/server.js";
@@ -6252,4 +6253,46 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
     '<head><link rel="icon" title="see href=data:image/png,decoy" href="https://cdn.example.com/logo.png"></head>',
   );
   assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
+});
+
+test("resolveInitialAnnotateMode respects query params and environment variables", () => {
+  // Defaults to true when unconfigured
+  assert.equal(resolveInitialAnnotateMode({}, {}), true);
+
+  // Query parameter annotate=off / false / explore
+  assert.equal(resolveInitialAnnotateMode({ annotate: "off" }, {}), false);
+  assert.equal(resolveInitialAnnotateMode({ annotate: "false" }, {}), false);
+  assert.equal(resolveInitialAnnotateMode({ mode: "explore" }, {}), false);
+  assert.equal(resolveInitialAnnotateMode({ explore: "true" }, {}), false);
+  assert.equal(resolveInitialAnnotateMode({ explore: "" }, {}), false);
+
+  // Query parameter annotate=on / true / annotate
+  assert.equal(resolveInitialAnnotateMode({ annotate: "on" }, { LAVISH_AXI_ANNOTATE_DEFAULT: "off" }), true);
+  assert.equal(resolveInitialAnnotateMode({ mode: "annotate" }, { LAVISH_AXI_ANNOTATE_DEFAULT: "off" }), true);
+
+  // Environment variable LAVISH_AXI_ANNOTATE_DEFAULT
+  assert.equal(resolveInitialAnnotateMode({}, { LAVISH_AXI_ANNOTATE_DEFAULT: "off" }), false);
+  assert.equal(resolveInitialAnnotateMode({}, { LAVISH_AXI_ANNOTATE_DEFAULT: "false" }), false);
+  assert.equal(resolveInitialAnnotateMode({}, { LAVISH_AXI_ANNOTATE_DEFAULT: "explore" }), false);
+  assert.equal(resolveInitialAnnotateMode({}, { LAVISH_AXI_ANNOTATE_DEFAULT: "on" }), true);
+});
+
+test("createChromeHtml renders initialAnnotate on switch, session script and iframe", () => {
+  const onHtml = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { initialAnnotate: true });
+  assert.match(onHtml, /id="annotation"[^>]*aria-pressed="true"/);
+  assert.match(onHtml, /"initialAnnotate":true/);
+  assert.match(onHtml, /data-artifact-src="\/artifact\/abc\/index\.html"/);
+
+  const offHtml = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { initialAnnotate: false });
+  assert.match(offHtml, /id="annotation"[^>]*aria-pressed="false"/);
+  assert.match(offHtml, /"initialAnnotate":false/);
+  assert.match(offHtml, /data-artifact-src="\/artifact\/abc\/index\.html\?annotate=off"/);
+});
+
+test("createSdkJs passes initialAnnotate into artifact SDK options", () => {
+  const onJs = createSdkJs("abc", 0, "token", { initialAnnotate: true });
+  assert.match(onJs, /"initialAnnotate":true/);
+
+  const offJs = createSdkJs("abc", 0, "token", { initialAnnotate: false });
+  assert.match(offJs, /"initialAnnotate":false/);
 });
