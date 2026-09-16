@@ -303,8 +303,13 @@ async function createChromeHarness({
       addEventListener(type, handler) {
         this.listeners.set(type, handler);
       }
+
+      close() {
+        this.closed = true;
+      }
     },
     document: {
+      hidden: false,
       body: element("body"),
       get activeElement() {
         return activeElement;
@@ -407,8 +412,11 @@ async function createChromeHarness({
       return { source, posted };
     },
     eventSource() {
-      assert.equal(eventSources.length, 1);
-      return eventSources[0];
+      return eventSources.at(-1);
+    },
+    setHidden(hidden) {
+      context.document.hidden = hidden;
+      for (const { handler } of documentListeners.get("visibilitychange") || []) handler({});
     },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
@@ -1850,6 +1858,7 @@ test("a stale queued layout prompt remains available for user re-decision", asyn
   row.children[0].checked = true;
   row.children[0].dispatch("change");
   await chrome.element("warningsQueueButton").onclick();
+  chrome.element("send").onclick();
   chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "" });
   await flushPromises();
 
@@ -4758,6 +4767,134 @@ test("whiteboard close stays responsive while overlay initialization is pending"
 
   releaseOverlaySources?.();
   await flushPromises();
+});
+
+test("Send delivers queued annotations when the artifact never returns a snapshot", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).endsWith("/prompts")) posts.push(JSON.parse(init.body));
+      return { ok: true };
+    },
+  });
+  const prompt = { prompt: "Keep this annotation", selector: "#intro", tag: "note", text: "Intro" };
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt });
+  chrome.element("send").onclick();
+  chrome.element("send").onclick();
+  assert.equal(posts.length, 0);
+  chrome.runTimers(1500);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0], { prompts: [prompt], domSnapshot: "" });
+  assert.equal(chrome.queued().length, 0);
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late snapshot" });
+  chrome.runTimers(1500);
+  await flushPromises();
+  assert.equal(posts.length, 1, "a late snapshot must not send a duplicate batch");
+});
+
+test("a failed snapshot-independent Send keeps annotations and explains the failure", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: false, status: 503 }),
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Keep me", tag: "note" } });
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.queued().length, 1);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.match(chrome.element("sendHint").textContent, /could not send|couldn't send/i);
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late snapshot" });
+  await flushPromises();
+  assert.equal(chrome.queued().length, 1, "late optional context must not retry a refused batch");
+});
+
+test("repeated Send during a snapshot fallback POST does not duplicate annotations", async () => {
+  const posts = [];
+  let resolvePost = () => {};
+  const pendingPost = new Promise((resolve) => {
+    resolvePost = () => resolve({ ok: true });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).endsWith("/prompts")) {
+        posts.push(JSON.parse(init.body));
+        return pendingPost;
+      }
+      return { ok: true };
+    },
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Only once", tag: "note" } });
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  resolvePost();
+  await flushPromises();
+  await flushPromises();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late" });
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "also late" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("first navigation waits for its own load token instead of navigating the inherited token", async () => {
+  let resolveLoad = (_value) => {};
+  const pendingLoad = new Promise((resolve) => {
+    resolveLoad = resolve;
+  });
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: {
+      ...defaultSessionData,
+      chromeLoadToken: "current-chrome",
+      initialArtifactRevision: 2,
+      initialArtifactLoadToken: "inherited",
+    },
+    beginLoadResponses: [{ ok: true, json: () => pendingLoad }],
+  });
+  assert.equal(chrome.frame.src, "", "an inherited token can expire before its document arrives");
+  resolveLoad({ artifact_revision: 3, artifact_load_token: "owned" });
+  await flushPromises();
+  assert.match(chrome.frame.src, /artifact_load_token=owned/);
+});
+
+test("hidden review tabs release SSE sockets and resynchronize on return", async () => {
+  const chrome = await createChromeHarness({ storedQueue: [{ prompt: "Keep my note", tag: "message" }] });
+  const first = chrome.eventSource();
+  chrome.setHidden(true);
+  assert.equal(first.closed, true);
+  chrome.setHidden(false);
+  const second = chrome.eventSource();
+  assert.notEqual(second, first);
+  assert.ok(second.listeners.has("chat-sync"));
+  assert.ok(second.listeners.has("ended"));
+  assert.equal(chrome.queued()[0].prompt, "Keep my note");
+});
+
+test("a stalled feedback POST aborts visibly and keeps the exact queue", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt: "Keep exact annotation", tag: "message" }],
+    fetchImpl: (url, init) => {
+      if (!String(url).endsWith("/prompts")) return Promise.resolve({ ok: true, json: async () => ({}) });
+      return new Promise((resolve, reject) =>
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted"))),
+      );
+    },
+  });
+  chrome.element("send").click();
+  chrome.runTimers(1500);
+  await flushPromises();
+  chrome.runTimers(15000);
+  await flushPromises();
+  assert.equal(chrome.queued()[0].prompt, "Keep exact annotation");
+  assert.match(chrome.element("sendHint").textContent, /not confirmed/);
 });
 
 test("a silent artifact is probed for a fatal failure, and a talking one is not", async () => {
