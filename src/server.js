@@ -52,6 +52,7 @@ import {
   splitExportWarnings,
 } from "./export-bundle.js";
 import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from "./html-app.js";
+import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { injectLavishSdk } from "./html-transform.js";
 import {
   bindHost,
@@ -103,6 +104,8 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
 const NETWORK_RECONCILE_CACHE_MS = 1_000;
 const TAILSCALE_BIND_RETRY_DELAYS_MS = [100, 250, 500];
+const WEBSOCKET_CLOSE_GRACE_MS = 250;
+const BROWSER_DISCONNECT_GRACE_MS = 10_000;
 // An escaped popup can navigate to an artifact-owned HTML or SVG asset on the
 // server origin. Keep every artifact response sandboxed at the response layer
 // so active documents stay opaque-origin even when they are top-level.
@@ -234,7 +237,7 @@ export function isValidWhiteboardChannelToken(token, secret, sessionKey, now = D
   return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
-// A detached server should not live forever. When no browser chrome (SSE) and no agent poll
+// A detached server should not live forever. When no browser chrome or agent poll
 // are connected for this long, the server shuts itself down so it stops dangling. The next
 // `lavish-axi <file>` invocation re-spawns a fresh server and adopts resumable sessions from
 // state.json. Browser-ended sessions still require the explicit --reopen opt-in. Set
@@ -259,6 +262,7 @@ export async function serve({
   debug = false,
   log = null,
   pollHeartbeatMs = 15_000,
+  browserDisconnectGraceMs = BROWSER_DISCONNECT_GRACE_MS,
   idleTimeoutMs = resolveIdleTimeoutMs(),
   host = bindHost(env),
   hosts,
@@ -268,6 +272,8 @@ export async function serve({
   lookupHost,
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 } = {}) {
+  // Keep the transport dependency off fast metadata paths such as `--version`.
+  const { WebSocket, WebSocketServer } = await import("ws");
   const extraHosts = allowedHosts ?? extraAllowedHosts(env);
   const envHost = env.LAVISH_AXI_HOST?.trim();
   const autoTailscale = !envHost;
@@ -290,8 +296,10 @@ export async function serve({
   const activePolls = new Map();
   const deliveredFeedback = new Set();
   // Keyed by session so a version-driven shutdown can reload the one chrome whose artifact is
-  // being reopened and leave every other open review page on screen.
-  const sseClients = new Map();
+  // being reopened and leave every other open review page on screen. Current chromes use a
+  // WebSocket, while the legacy SSE route remains available during rolling local upgrades.
+  const liveEventClients = new Map();
+  const browserDisconnectTimers = new Map();
   const whiteboardChannelSecret = crypto.randomBytes(32);
   // Sessions with at least one warning the user queued that has not been re-checked yet.
   const outstandingRepairBatches = new Set();
@@ -304,8 +312,80 @@ export async function serve({
   let serverReady = false;
   let networkReconcileCheckedAt = 0;
   let cachedNetworkStale = false;
+  let shuttingDown = false;
   /** @type {Promise<boolean> | null} */
   let networkReconcilePromise = null;
+
+  function broadcastLiveEvent(type, key, data = {}) {
+    for (const [client, clientKey] of liveEventClients) {
+      if (clientKey === key) client.sendEvent(type, data);
+    }
+  }
+
+  // One listener per event scales independently of the number of open review tabs and avoids the
+  // EventEmitter listener warning the former one-listener-per-SSE-client design reached at only a
+  // few boards.
+  events.on("reload", (key) => broadcastLiveEvent("reload", key));
+  // The transcript the chrome renders is computed here (src/chat-messages.js): agent text ships
+  // with its rendered html, user entries ship as text with their anchor, never as html.
+  events.on("agent-reply", (key, entry) => broadcastLiveEvent("agent-reply", key, entry));
+  events.on("chat-sync", (key, session) => broadcastLiveEvent("chat-sync", key, serializeChatSync(session)));
+  events.on("agent-presence", (key, state) => broadcastLiveEvent("agent-presence", key, { state }));
+  events.on("layout-warnings", (key, warnings) => broadcastLiveEvent("layout-warnings", key, { warnings }));
+  events.on("ended", (key, endedBy) => broadcastLiveEvent("ended", key, { ended_by: endedBy || null }));
+
+  function hasLiveEventClient(key) {
+    for (const clientKey of liveEventClients.values()) {
+      if (clientKey === key) return true;
+    }
+    return false;
+  }
+
+  function clearBrowserDisconnectTimer(key) {
+    const timer = browserDisconnectTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    browserDisconnectTimers.delete(key);
+  }
+
+  function scheduleBrowserDisconnect(key) {
+    clearBrowserDisconnectTimer(key);
+    if (shuttingDown || hasLiveEventClient(key) || !activePolls.has(key)) return;
+    const timer = setTimeout(() => {
+      browserDisconnectTimers.delete(key);
+      if (!hasLiveEventClient(key) && activePolls.has(key)) events.emit("browser-disconnected", key);
+    }, browserDisconnectGraceMs);
+    timer.unref?.();
+    browserDisconnectTimers.set(key, timer);
+  }
+
+  function attachLiveEventClient(client, key, onClose) {
+    clearBrowserDisconnectTimer(key);
+    liveEventClients.set(client, key);
+    refreshIdleTimer();
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      liveEventClients.delete(client);
+      scheduleBrowserDisconnect(key);
+      refreshIdleTimer();
+    };
+    onClose(cleanup);
+    return cleanup;
+  }
+
+  async function sendInitialLiveEventState(client, key, cleanup) {
+    const session = await store.findByKey(key);
+    if (client.isClosed()) {
+      cleanup();
+      return;
+    }
+    client.sendEvent("chat-sync", serializeChatSync(session));
+    client.sendEvent("agent-presence", { state: computePresence(key, activePolls, deliveredFeedback) });
+    // A connection that attaches after the live end event still needs the terminal snapshot.
+    if (session?.status === "ended") client.sendEvent("ended", { ended_by: session.ended_by || null });
+  }
 
   async function reconcileTailscaleNetwork() {
     if (Date.now() - networkReconcileCheckedAt < NETWORK_RECONCILE_CACHE_MS) return cachedNetworkStale;
@@ -332,14 +412,11 @@ export async function serve({
 
   function finishFeedbackDelivery(key, result) {
     if (result.status !== "feedback") return;
-    const chat = result.chat;
-    delete result.chat;
     markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
     // A batch flagged `session_ended` is the last one this session will ever deliver, so no
     // later poll or agent reply can retire the working state markFeedbackDelivered just set:
     // release it here or presence reports an agent still working on a session that is over.
     if (result.session_ended) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-    if (Array.isArray(chat)) events.emit("chat-sync", key, chat);
   }
 
   // `takeFeedback` is destructive: it clears the batch from `state.json` before anything is
@@ -666,25 +743,30 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
+        events.off("browser-disconnected", onBrowserDisconnected);
         setPollActive(key, activePolls, deliveredFeedback, events, false);
+        if (!activePolls.has(key)) clearBrowserDisconnectTimer(key);
         refreshIdleTimer();
         cleanupPoll = null;
         detachRequestClose();
       };
-      const respond = async () => {
+      const respond = async (forcedResult = null) => {
         if (responding || res.writableEnded) return;
         responding = true;
         try {
           const result = await store.takeFeedback(key);
+          // Feedback or an explicit end that raced the grace timer wins. The disconnect result
+          // is only the non-terminal replacement for a poll that would otherwise keep waiting.
+          const responseResult = forcedResult && result.status === "waiting" ? forcedResult : result;
           if (requestClosed || req.destroyed || res.writableEnded) {
-            await restoreClosedFeedback(key, result);
+            await restoreClosedFeedback(key, responseResult);
             return;
           }
-          finishFeedbackDelivery(key, result);
+          finishFeedbackDelivery(key, responseResult);
           if (streamHeartbeat) {
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify(responseResult));
           } else {
-            res.json(result);
+            res.json(responseResult);
           }
         } finally {
           cleanup();
@@ -704,8 +786,13 @@ export async function serve({
         }
         respond().catch(handleRespondError);
       };
+      const onBrowserDisconnected = (changedKey) => {
+        if (changedKey !== key || res.writableEnded) return;
+        respond({ status: "browser_disconnected" }).catch(handleRespondError);
+      };
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
+      events.on("browser-disconnected", onBrowserDisconnected);
       cleanupPoll = cleanup;
       if (requestClosed || req.destroyed || res.writableEnded) {
         cleanup();
@@ -752,7 +839,7 @@ export async function serve({
       }
       // The session was already ended by someone else before this batch arrived - no agent will
       // ever poll it again, so a 200 here would be a lie. Nothing was persisted; the chrome keeps
-      // its queue and goes read-only itself in case it missed the SSE `ended` event.
+      // its queue and goes read-only itself in case it missed the live `ended` event.
       if (result.ended) {
         res.status(409).json({ status: "ended", error: "session already ended", ended_by: result.ended_by });
         return;
@@ -779,13 +866,25 @@ export async function serve({
         });
         return;
       }
+      const freshFeedback = session.fresh_feedback === true;
       if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      let publishedSession = session;
       if (hasLayoutWarningPrompt) {
         await syncOutstandingRepairs(req.params.key);
-        events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(session.layout_warnings));
+        publishedSession = (await store.findByKey(req.params.key)) || session;
+        events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(publishedSession.layout_warnings));
       }
-      events.emit(shouldEndSession ? "ended" : "feedback", req.params.key, session.ended_by);
-      res.json({ status: "queued", pending_prompts: session.pending_prompts });
+      if (shouldEndSession) events.emit("ended", req.params.key, publishedSession.ended_by);
+      else if (freshFeedback) events.emit("feedback", req.params.key, publishedSession.ended_by);
+      // The accepted batch is part of the conversation now: answer with the transcript so the
+      // sending chrome can settle its queued bubbles in place, and sync every other tab of this
+      // session at send time rather than when a poll happens to take the batch.
+      events.emit("chat-sync", req.params.key, publishedSession);
+      res.json({
+        status: "queued",
+        pending_prompts: publishedSession.pending_prompts,
+        ...serializeChatSync(publishedSession),
+      });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
@@ -903,7 +1002,11 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      events.emit("agent-reply", req.params.key, text);
+      const entry = serializeChat([
+        session.chat?.at(-1)?.role === "agent" ? session.chat.at(-1) : { role: "agent", text, at: session.updated_at },
+      ])[0];
+      events.emit("agent-reply", req.params.key, entry);
+      events.emit("chat-sync", req.params.key, session);
       // The reply concludes the delivered-feedback "working" state. Without this, a poll that
       // drains feedback and then releases leaves presence stuck on "working" even after the agent
       // answers. Human sends remain available while working because the server queues them for the
@@ -1237,85 +1340,13 @@ export async function serve({
     }
   });
 
-  app.get("/events/:key", async (req, res, next) => {
-    let cleanup = () => {};
-    try {
-      res.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-      });
-      sseClients.set(res, String(req.params.key || ""));
-      refreshIdleTimer();
-      const sendReload = (key) => {
-        if (key === req.params.key) {
-          res.write("event: reload\ndata: {}\n\n");
-        }
-      };
-      const sendAgentReply = (key, text) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
-        }
-      };
-      const sendPresence = (key, state) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
-        }
-      };
-      // Warning-inbox state lives on the server, so every attached chrome - including one that
-      // just reconnected after a browser refresh - converges on the same list.
-      const sendLayoutWarnings = (key, warnings) => {
-        if (key === req.params.key) {
-          res.write(`event: layout-warnings\ndata: ${JSON.stringify({ warnings })}\n\n`);
-        }
-      };
-      // A session end (`lavish-axi end` or the browser's own End/Send & End) must reach every
-      // attached chrome, not just a poll waiter - otherwise a tab left open keeps accepting Sends
-      // nobody will ever poll (#171).
-      const sendEnded = (key, endedBy) => {
-        if (key === req.params.key) {
-          res.write(`event: ended\ndata: ${JSON.stringify({ ended_by: endedBy || null })}\n\n`);
-        }
-      };
-      // Listeners must be registered BEFORE the read below: an end that lands during that await
-      // would otherwise fire "ended" while nothing here is listening yet, and this connection
-      // would never learn the session ended (#171).
-      events.on("reload", sendReload);
-      events.on("agent-reply", sendAgentReply);
-      events.on("agent-presence", sendPresence);
-      events.on("layout-warnings", sendLayoutWarnings);
-      events.on("ended", sendEnded);
-      let cleanedUp = false;
-      cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        req.off("close", cleanup);
-        sseClients.delete(res);
-        events.off("reload", sendReload);
-        events.off("agent-reply", sendAgentReply);
-        events.off("agent-presence", sendPresence);
-        events.off("layout-warnings", sendLayoutWarnings);
-        events.off("ended", sendEnded);
-        refreshIdleTimer();
-      };
-      req.once("close", cleanup);
-      const session = await store.findByKey(req.params.key);
-      if (req.destroyed || res.writableEnded) {
-        cleanup();
-        return;
-      }
-      res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
-      res.write(
-        `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
-      );
-      // A connection that attaches (or reconnects) to a session already ended - including one
-      // that misses the live "ended" event entirely by connecting after it fired - still needs to
-      // learn that on its own; `markSessionEnded()` is idempotent, so a duplicate is harmless.
-      if (session?.status === "ended") sendEnded(req.params.key, session.ended_by);
-    } catch (error) {
-      cleanup();
-      next(error);
-    }
+  app.get("/events/:key", (_req, res) => {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "close",
+    });
+    res.end(`event: chrome-reload\ndata: ${JSON.stringify({ reason: "server-restarted" })}\n\n`);
   });
 
   app.get("/chrome-client.js", async (req, res, next) => {
@@ -1545,7 +1576,7 @@ export async function serve({
   // like the whiteboard writes - a hostile cross-origin page must not drive them.
   app.post("/api/:key/attachments", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin attachment upload rejected" });
         return;
       }
@@ -1607,7 +1638,7 @@ export async function serve({
 
   app.delete("/api/:key/attachments/:id", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin attachment delete rejected" });
         return;
       }
@@ -1636,6 +1667,76 @@ export async function serve({
     res.status(status).json({ error: error instanceof Error ? error.message : String(error) });
   });
 
+  const eventWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+
+  function rejectEventUpgrade(socket, status, message) {
+    const body = `${message}\n`;
+    socket.end(
+      `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+    );
+  }
+
+  function handleEventUpgrade(req, socket, head) {
+    let pathname;
+    try {
+      pathname = new URL(String(req.url || ""), "http://lavish.local").pathname;
+    } catch {
+      rejectEventUpgrade(socket, 400, "Bad Request");
+      return;
+    }
+    const match = pathname.match(/^\/events\/([^/]+)$/);
+    if (!match) {
+      rejectEventUpgrade(socket, 404, "Not Found");
+      return;
+    }
+
+    const hostAllowed = allowAnyHostname
+      ? parseHostAuthority(req.headers.host) !== null
+      : isAllowedRequestHost(
+          { host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"] },
+          allowedHostnames,
+        );
+    // WebSocket reads are not protected by CORS. Require the chrome page's exact Origin as well
+    // as the normal Host allowlist so a foreign site cannot read a known session's live events.
+    if (!hostAllowed || !req.headers.origin || !isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+      rejectEventUpgrade(socket, 403, "Forbidden");
+      return;
+    }
+
+    let key;
+    try {
+      key = decodeURIComponent(match[1]);
+    } catch {
+      rejectEventUpgrade(socket, 400, "Bad Request");
+      return;
+    }
+    eventWebSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
+      const client = {
+        sendEvent(type, data) {
+          if (webSocket.readyState === WebSocket.OPEN) webSocket.send(JSON.stringify({ type, data }));
+        },
+        close(code = 1001, reason = "Lavish server shutdown") {
+          webSocket.close(code, reason);
+          const terminateTimer = setTimeout(() => {
+            if (webSocket.readyState !== WebSocket.CLOSED) webSocket.terminate();
+          }, WEBSOCKET_CLOSE_GRACE_MS);
+          terminateTimer.unref?.();
+          webSocket.once("close", () => clearTimeout(terminateTimer));
+        },
+        isClosed() {
+          return webSocket.readyState === WebSocket.CLOSING || webSocket.readyState === WebSocket.CLOSED;
+        },
+      };
+      webSocket.on("error", () => {});
+      const cleanup = attachLiveEventClient(client, key, (remove) => webSocket.once("close", remove));
+      sendInitialLiveEventState(client, key, cleanup).catch((error) => {
+        client.close(1011, "Failed to initialize live events");
+        cleanup();
+        logEvent?.(`event WebSocket initialization failed session=${key}: ${error?.message || error}`);
+      });
+    });
+  }
+
   const httpServers = [];
   const boundHosts = [];
   let boundPort = port;
@@ -1645,6 +1746,7 @@ export async function serve({
     while (true) {
       try {
         const httpServer = await listenHttp(app, boundPort, listenHost);
+        httpServer.on("upgrade", handleEventUpgrade);
         if (boundPort === 0) boundPort = httpServer.address().port;
         httpServers.push(httpServer);
         boundHosts.push(listenHost);
@@ -1684,7 +1786,6 @@ export async function serve({
   publicPort = httpServers[0].address().port;
   serverReady = true;
 
-  let shuttingDown = false;
   function shutdown(reloadKey = "", reason = "") {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1702,20 +1803,22 @@ export async function serve({
     // page the user is reading or writing in is exactly what this avoids.
     // Both events carry the same reason: the reloaded page can end up showing a line from it too,
     // and two pages describing one shutdown differently is how a false claim gets in.
-    const shutdownData = JSON.stringify({ reason });
-    for (const [res, clientKey] of sseClients) {
+    const shutdownData = { reason };
+    for (const [client, clientKey] of liveEventClients) {
       try {
         if (reloadKey && clientKey === reloadKey) {
-          res.write(`event: chrome-reload\ndata: ${shutdownData}\n\n`);
+          client.sendEvent("chrome-reload", shutdownData);
         } else {
-          res.write(`event: chrome-outdated\ndata: ${shutdownData}\n\n`);
+          client.sendEvent("chrome-outdated", shutdownData);
         }
-        res.end();
+        client.close();
       } catch {
         // best effort
       }
     }
-    sseClients.clear();
+    liveEventClients.clear();
+    for (const timer of browserDisconnectTimers.values()) clearTimeout(timer);
+    browserDisconnectTimers.clear();
     for (const w of watchers.values()) {
       w.close().catch(() => {});
     }
@@ -1727,14 +1830,14 @@ export async function serve({
     };
     for (const httpServer of httpServers) {
       httpServer.close(closed);
-      // Force-close keep-alive sockets so SSE / long-polls don't keep us alive.
+      // Force-close keep-alive sockets so legacy SSE / long-polls don't keep us alive.
       if (typeof httpServer.closeAllConnections === "function") {
         httpServer.closeAllConnections();
       }
     }
   }
 
-  // Idle self-shutdown: the timer only runs while nothing is connected. Any live SSE chrome or
+  // Idle self-shutdown: the timer only runs while nothing is connected. Any live event chrome or
   // active long-poll cancels it; losing the last connection (re)arms it.
   let idleTimer = null;
   function refreshIdleTimer() {
@@ -1743,10 +1846,10 @@ export async function serve({
       idleTimer = null;
     }
     if (shuttingDown || idleTimeoutMs == null) return;
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    if (liveEventClients.size > 0 || activePolls.size > 0) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!shuttingDown && sseClients.size === 0 && activePolls.size === 0) {
+      if (!shuttingDown && liveEventClients.size === 0 && activePolls.size === 0) {
         logEvent?.(`idle for ${idleTimeoutMs}ms with no connections, shutting down`);
         shutdown();
       }
@@ -1760,7 +1863,7 @@ export async function serve({
   // idle timer reap it once those connections drop. Best-effort: never let a read failure
   // block the end response.
   async function shutdownIfNoLiveSessions() {
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    if (liveEventClients.size > 0 || activePolls.size > 0) return;
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
@@ -2048,9 +2151,9 @@ function isSameOriginRequest(req, allowedHostnames, allowAnyHostname = false) {
   const host = parseHostAuthority(req.headers.host);
   if (!host) return false;
 
-  let protocol = req.protocol;
+  let protocol = req.protocol || "http";
   let authority = host;
-  const forwardedHost = String(req.get("x-forwarded-host") || "")
+  const forwardedHost = String(req.headers["x-forwarded-host"] || "")
     .split(",")
     .pop()
     .trim();
@@ -2062,7 +2165,7 @@ function isSameOriginRequest(req, allowedHostnames, allowAnyHostname = false) {
         (!allowedHostnames.has(host.hostname) || !allowedHostnames.has(forwardedAuthority.hostname)))
     )
       return false;
-    protocol = String(req.get("x-forwarded-proto") || req.protocol)
+    protocol = String(req.headers["x-forwarded-proto"] || protocol)
       .split(",")
       .pop()
       .trim()
@@ -2072,14 +2175,14 @@ function isSameOriginRequest(req, allowedHostnames, allowAnyHostname = false) {
   }
   const expectedOrigin = normalizeOrigin(`${protocol}://${authority.authority}`);
   if (!expectedOrigin) return false;
-  const origin = req.get("origin");
+  const origin = req.headers.origin;
   if (origin) {
     if (origin === "null" && isLoopbackHostname(authority.hostname)) {
       return true;
     }
     return normalizeOrigin(origin) === expectedOrigin;
   }
-  const referer = req.get("referer");
+  const referer = req.headers.referer;
   return Boolean(referer) && normalizeOrigin(referer) === expectedOrigin;
 }
 
@@ -2522,12 +2625,15 @@ export function createChromeHtml(
   const sessionJson = jsonScript({
     key: session.key,
     file: session.file,
-    // A page loaded (or reloaded) after the session already ended has no future SSE `ended`
+    // A page loaded (or reloaded) after the session already ended has no future live `ended`
     // event to wait for - it must start read-only instead of looking live until the user tries
     // to send and gets refused (#171).
     initialEnded: session.status === "ended",
     initialEndedBy: session.ended_by || null,
-    initialChat: session.chat || [],
+    initialChat: serializeChat(session.chat || []),
+    initialChatAckIds: serializeChatAckIds(session.chat_ack_ids),
+    initialChatRevision:
+      Number.isSafeInteger(session.chat_revision) && session.chat_revision >= 0 ? session.chat_revision : 0,
     // Bootstrapping the inbox from the server is what makes it survive a browser refresh or a
     // reconnect: the chrome never owns warning state, it only renders it.
     initialLayoutWarnings: serializeLayoutWarnings(session.layout_warnings),
@@ -2563,7 +2669,7 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="${initialAnnotate ? "true" : "false"}" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div>${sourceMarkdownMenu}<div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html${initialAnnotate ? "" : "?annotate=off"}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html${initialAnnotate ? "" : "?annotate=off"}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>

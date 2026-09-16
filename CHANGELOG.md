@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.1.70](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.69...lavish-axi-v0.1.70) (2026-09-16)
+
+
+### Bug Fixes
+
+* bound stored review transcripts ([#340](https://github.com/kunchenguid/lavish-axi/issues/340)) ([93eb9c0](https://github.com/kunchenguid/lavish-axi/commit/93eb9c08fd451fd0d44f6185b8babd50a4d4d709))
+
+## [0.1.69](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.68...lavish-axi-v0.1.69) (2026-09-16)
+
+
+### Features
+
+* add structured conversation history ([#337](https://github.com/kunchenguid/lavish-axi/issues/337)) ([c95f3c4](https://github.com/kunchenguid/lavish-axi/commit/c95f3c474beebcb0f0df09a5e90ef5ab5633bb84))
+
+
+### Bug Fixes
+
+* settle queued feedback by durable prompt identity ([#339](https://github.com/kunchenguid/lavish-axi/issues/339)) ([7f1c477](https://github.com/kunchenguid/lavish-axi/commit/7f1c47744773a3db5f1af97bd256a347ee9680b8))
+
+## [0.1.68](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.67...lavish-axi-v0.1.68) (2026-09-15)
+
+
+### Bug Fixes
+
+* **chrome:** prevent feedback from stalling during snapshot capture ([#334](https://github.com/kunchenguid/lavish-axi/issues/334)) ([830efa8](https://github.com/kunchenguid/lavish-axi/commit/830efa80da49dda662232594630bf0c4e459fee8))
+
+## [0.1.67](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.66...lavish-axi-v0.1.67) (2026-09-07)
+
+
+### Bug Fixes
+
+* **server:** release polls after review browser disconnects ([#329](https://github.com/kunchenguid/lavish-axi/issues/329)) ([dcf49d3](https://github.com/kunchenguid/lavish-axi/commit/dcf49d3ff6e2e0789d1ebdf9c03ceca4a08d11fb))
+
+## [0.1.66](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.65...lavish-axi-v0.1.66) (2026-09-06)
+
+
+### Features
+
+* add tracked batch input guidance ([#327](https://github.com/kunchenguid/lavish-axi/issues/327)) ([38747bf](https://github.com/kunchenguid/lavish-axi/commit/38747bfc0f554b3088990a053ab36968e2c8619a))
+
+## [0.1.65](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.64...lavish-axi-v0.1.65) (2026-09-05)
+
+
+### Bug Fixes
+
+* keep multiple review boards responsive ([#324](https://github.com/kunchenguid/lavish-axi/issues/324)) ([27be6be](https://github.com/kunchenguid/lavish-axi/commit/27be6bee7368fe08072c1448a4541d20d6ec2a6b))
+
+## [0.1.64](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.63...lavish-axi-v0.1.64) (2026-09-03)
+
+
+### Bug Fixes
+
+* attachment upload 500s behind a reverse proxy (x-forwarded-host) ([#319](https://github.com/kunchenguid/lavish-axi/issues/319)) ([19a0800](https://github.com/kunchenguid/lavish-axi/commit/19a0800809c469d7924daf5cee1d80dbbef3175f))
+
 ## [0.1.63](https://github.com/kunchenguid/lavish-axi/compare/lavish-axi-v0.1.62...lavish-axi-v0.1.63) (2026-08-29)
 
 
