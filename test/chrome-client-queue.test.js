@@ -11,12 +11,13 @@ const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
 // that stopped declaring one would leave the corresponding feature silently dead behind an
 // `if (element)` guard - a harness that invents an element for any id would never notice.
 const servedChromeIds = new Set(
-  [...createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }).matchAll(/\sid="([^"]+)"/g)].map(
-    (match) => match[1],
-  ),
+  [
+    createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }),
+    createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { sourceMarkdownPath: "/tmp/artifact.md" }),
+  ].flatMap((html) => [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1])),
 );
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, sourceMarkdownPath?: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialAnnotate?: boolean, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -303,8 +304,13 @@ async function createChromeHarness({
       addEventListener(type, handler) {
         this.listeners.set(type, handler);
       }
+
+      close() {
+        this.closed = true;
+      }
     },
     document: {
+      hidden: false,
       body: element("body"),
       get activeElement() {
         return activeElement;
@@ -407,8 +413,11 @@ async function createChromeHarness({
       return { source, posted };
     },
     eventSource() {
-      assert.equal(eventSources.length, 1);
-      return eventSources[0];
+      return eventSources.at(-1);
+    },
+    setHidden(hidden) {
+      context.document.hidden = hidden;
+      for (const { handler } of documentListeners.get("visibilitychange") || []) handler({});
     },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
@@ -1850,6 +1859,7 @@ test("a stale queued layout prompt remains available for user re-decision", asyn
   row.children[0].checked = true;
   row.children[0].dispatch("change");
   await chrome.element("warningsQueueButton").onclick();
+  chrome.element("send").onclick();
   chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "" });
   await flushPromises();
 
@@ -2005,6 +2015,26 @@ test("chrome client surfaces export notices from the server response", async () 
   await flushPromises();
 
   assert.equal(chrome.element("exportArtifact").querySelector("span").textContent, "Exported with 1 notice");
+});
+
+test("chrome client downloads the source Markdown that the report bound to its session", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, sourceMarkdownPath: "/tmp/artifact.md" },
+    fetchImpl: async (url) => {
+      requests.push(String(url));
+      return {
+        ok: true,
+        blob: async () => ({}),
+      };
+    },
+  });
+
+  await chrome.element("exportSourceMarkdown").onclick();
+  await flushPromises();
+
+  assert.deepEqual(requests, ["/api/abc/source-markdown"]);
+  assert.equal(chrome.element("exportSourceMarkdown").querySelector("span").textContent, "Export source Markdown");
 });
 
 test("chrome client includes export notices alongside unresolved assets", async () => {
@@ -4262,7 +4292,7 @@ test("a queued Send refused because the session already ended marks the chrome r
 });
 
 test("Cmd/Ctrl+I toggles annotation mode from the chrome document, regardless of focus", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   const metaEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
   assert.equal(metaEvent.defaultPrevented, true);
@@ -4301,9 +4331,24 @@ test("plain 'i' and other modifier combos do not toggle annotation mode", async 
   assert.equal(framePostCount(), before);
 });
 
+test("chrome defaults to explore mode when a legacy session bootstrap omits the mode", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" },
+  });
+
+  // The harness does not parse the generated button attributes; a first toggle to true is the
+  // observable proof that the omitted bootstrap value started in Explore mode.
+  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+  const event = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, true);
+});
+
 test("chrome client reads the mode toggle hotkey from the session bootstrap", async () => {
   const chrome = await createChromeHarness({
-    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "k" },
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "k", initialAnnotate: true },
   });
 
   const oldHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
@@ -4318,7 +4363,7 @@ test("chrome client reads the mode toggle hotkey from the session bootstrap", as
 });
 
 test("chrome client toggles annotation mode when the artifact SDK requests it via postMessage", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   chrome.sendFrameMessage({ type: "lavish:toggleAnnotationMode" });
 
@@ -4333,7 +4378,7 @@ test("chrome client toggles annotation mode when the artifact SDK requests it vi
 });
 
 test("chrome client ignores annotation mode toggles after the session ends", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
   assert.equal(chrome.element("annotation")["aria-pressed"], "false");
@@ -4758,6 +4803,134 @@ test("whiteboard close stays responsive while overlay initialization is pending"
 
   releaseOverlaySources?.();
   await flushPromises();
+});
+
+test("Send delivers queued annotations when the artifact never returns a snapshot", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).endsWith("/prompts")) posts.push(JSON.parse(init.body));
+      return { ok: true };
+    },
+  });
+  const prompt = { prompt: "Keep this annotation", selector: "#intro", tag: "note", text: "Intro" };
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt });
+  chrome.element("send").onclick();
+  chrome.element("send").onclick();
+  assert.equal(posts.length, 0);
+  chrome.runTimers(1500);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0], { prompts: [prompt], domSnapshot: "" });
+  assert.equal(chrome.queued().length, 0);
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late snapshot" });
+  chrome.runTimers(1500);
+  await flushPromises();
+  assert.equal(posts.length, 1, "a late snapshot must not send a duplicate batch");
+});
+
+test("a failed snapshot-independent Send keeps annotations and explains the failure", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: false, status: 503 }),
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Keep me", tag: "note" } });
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.queued().length, 1);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.match(chrome.element("sendHint").textContent, /could not send|couldn't send/i);
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late snapshot" });
+  await flushPromises();
+  assert.equal(chrome.queued().length, 1, "late optional context must not retry a refused batch");
+});
+
+test("repeated Send during a snapshot fallback POST does not duplicate annotations", async () => {
+  const posts = [];
+  let resolvePost = () => {};
+  const pendingPost = new Promise((resolve) => {
+    resolvePost = () => resolve({ ok: true });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).endsWith("/prompts")) {
+        posts.push(JSON.parse(init.body));
+        return pendingPost;
+      }
+      return { ok: true };
+    },
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Only once", tag: "note" } });
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  chrome.element("send").onclick();
+  chrome.runTimers(1500);
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  resolvePost();
+  await flushPromises();
+  await flushPromises();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "late" });
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "also late" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("first navigation waits for its own load token instead of navigating the inherited token", async () => {
+  let resolveLoad = (_value) => {};
+  const pendingLoad = new Promise((resolve) => {
+    resolveLoad = resolve;
+  });
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: {
+      ...defaultSessionData,
+      chromeLoadToken: "current-chrome",
+      initialArtifactRevision: 2,
+      initialArtifactLoadToken: "inherited",
+    },
+    beginLoadResponses: [{ ok: true, json: () => pendingLoad }],
+  });
+  assert.equal(chrome.frame.src, "", "an inherited token can expire before its document arrives");
+  resolveLoad({ artifact_revision: 3, artifact_load_token: "owned" });
+  await flushPromises();
+  assert.match(chrome.frame.src, /artifact_load_token=owned/);
+});
+
+test("hidden review tabs release SSE sockets and resynchronize on return", async () => {
+  const chrome = await createChromeHarness({ storedQueue: [{ prompt: "Keep my note", tag: "message" }] });
+  const first = chrome.eventSource();
+  chrome.setHidden(true);
+  assert.equal(first.closed, true);
+  chrome.setHidden(false);
+  const second = chrome.eventSource();
+  assert.notEqual(second, first);
+  assert.ok(second.listeners.has("chat-sync"));
+  assert.ok(second.listeners.has("ended"));
+  assert.equal(chrome.queued()[0].prompt, "Keep my note");
+});
+
+test("a stalled feedback POST aborts visibly and keeps the exact queue", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt: "Keep exact annotation", tag: "message" }],
+    fetchImpl: (url, init) => {
+      if (!String(url).endsWith("/prompts")) return Promise.resolve({ ok: true, json: async () => ({}) });
+      return new Promise((resolve, reject) =>
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted"))),
+      );
+    },
+  });
+  chrome.element("send").click();
+  chrome.runTimers(1500);
+  await flushPromises();
+  chrome.runTimers(15000);
+  await flushPromises();
+  assert.equal(chrome.queued()[0].prompt, "Keep exact annotation");
+  assert.match(chrome.element("sendHint").textContent, /not confirmed/);
 });
 
 test("a silent artifact is probed for a fatal failure, and a talking one is not", async () => {

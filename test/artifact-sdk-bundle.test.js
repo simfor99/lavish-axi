@@ -104,8 +104,9 @@ function cell(tag, text) {
   return element;
 }
 
-function bootSdk({ runAnimationFrames = false } = {}) {
+function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
   const posted = [];
+  const clipboardWrites = [];
   const documentListeners = [];
   // Deferred work the SDK schedules, run only when a test asks for it: the draft-anchor settle
   // re-query is a real timer, and asserting on it means running it rather than assuming it.
@@ -116,6 +117,9 @@ function bootSdk({ runAnimationFrames = false } = {}) {
   };
   /** @type {(selector: string) => any} */
   let documentQuery = () => null;
+  /** @type {(selector: string) => any[]} */
+  let documentQueryAll = () => [];
+  const elementsById = new Map();
   const documentElement = createElement("html");
   const head = createElement("head");
   const body = createElement("body");
@@ -124,7 +128,7 @@ function bootSdk({ runAnimationFrames = false } = {}) {
 
   const sandbox = {
     parent: { postMessage: (message) => posted.push(message) },
-    navigator: { platform: "Linux" },
+    navigator: { platform: "Linux", clipboard: { writeText: async (value) => clipboardWrites.push(value) } },
     CSS: { escape: (value) => String(value) },
     Element: class Element {},
     MutationObserver: class MutationObserver {
@@ -155,12 +159,20 @@ function bootSdk({ runAnimationFrames = false } = {}) {
       addEventListener: (type, handler) => documentListeners.push({ type, handler }),
       removeEventListener() {},
       createElement,
-      getElementById: () => null,
+      getElementById: (id) => elementsById.get(id) || null,
       querySelector: (selector) => documentQuery(selector),
-      querySelectorAll: () => [],
+      querySelectorAll: (selector) => documentQueryAll(selector),
       getSelection: () => null,
     },
   };
+  // The browser's `instanceof Element` check is meaningful for the contextmenu path. The DOM
+  // stub uses plain objects, so mirror that check through the nodeType contract used by real
+  // elements instead of making the left-click test accidentally cover only the old mode.
+  Object.defineProperty(sandbox.Element, Symbol.hasInstance, {
+    value(instance) {
+      return Boolean(instance && instance.nodeType === 1);
+    },
+  });
   const windowListeners = [];
   sandbox.window = {
     addEventListener: (type, handler) => windowListeners.push({ type, handler }),
@@ -177,7 +189,7 @@ function bootSdk({ runAnimationFrames = false } = {}) {
   };
   sandbox.globalThis = sandbox;
 
-  vm.runInNewContext(createSdkJs("abc", 3, "load-token"), sandbox);
+  vm.runInNewContext(createSdkJs("abc", 3, "load-token", { initialAnnotate }), sandbox);
 
   return {
     posted,
@@ -188,9 +200,26 @@ function bootSdk({ runAnimationFrames = false } = {}) {
       assert.ok(listener, "the SDK registers a document click listener");
       listener.handler({ target, preventDefault() {}, stopPropagation() {} });
     },
+    rightClick(target) {
+      const listener = documentListeners.find((entry) => entry.type === "contextmenu");
+      assert.ok(listener, "the SDK registers a document contextmenu listener");
+      listener.handler({ target, clientX: 10, clientY: 10, preventDefault() {}, stopPropagation() {} });
+    },
     setDocumentQuery(query) {
       documentQuery = query;
     },
+    setDocumentQueryAll(query) {
+      documentQueryAll = query;
+    },
+    setElementById(id, element) {
+      elementsById.set(id, element);
+    },
+    trigger(type, event) {
+      const listeners = documentListeners.filter((entry) => entry.type === type);
+      assert.ok(listeners.length, `the SDK registers a document ${type} listener`);
+      for (const listener of listeners) listener.handler(event);
+    },
+    clipboardWrites,
     runTimers() {
       const pending = timers.splice(0, timers.length);
       for (const timer of pending) {
@@ -288,6 +317,57 @@ test("the served SDK bundle queues a table-cell annotation without a missing-hel
       text: "Drive, Neovide, Cursor",
     },
   );
+});
+
+test("explore mode keeps left clicks native while the SDK annotates on right click", () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const { evidence } = buildTable(sdk);
+
+  sdk.click(evidence);
+  assert.equal(sdk.cards().length, 0);
+
+  sdk.rightClick(evidence);
+  const message = sdk.queue("Check this permission");
+  assert.equal(message.type, "lavish:queuePrompt");
+  assert.equal(message.prompt.prompt, "Check this permission");
+});
+
+test("hovering a report card offers a Markdown copy control without opening an annotation", async () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const reportCard = appendTo(sdk.body, cell("article", "Nur mit Freigabe"));
+
+  sdk.trigger("mouseover", { target: reportCard });
+  const root = sdk.body.parentElement.children.find((child) => child.className === "lavish-annotation-root").shadowRoot;
+  const copyButton = root.children.find((child) => child.className === "lavish-copy-markdown");
+  assert.ok(copyButton, "a compact copy control is placed over the hovered card");
+
+  const click = copyButton.listeners.find((entry) => entry.type === "click");
+  assert.ok(click, "the control handles its own click");
+  await click.handler({ preventDefault() {}, stopPropagation() {} });
+
+  assert.deepEqual(sdk.clipboardWrites, ["Nur mit Freigabe"]);
+  assert.equal(sdk.cards().length, 0, "copying is a native card action, never an annotation");
+});
+
+test("scroll position marks the current sidebar section, including the final sources section", () => {
+  const sdk = bootSdk({ runAnimationFrames: true, initialAnnotate: false });
+  const firstLink = cell("a", "Start");
+  firstLink.setAttribute("href", "#start");
+  const sourceLink = cell("a", "Quellen");
+  sourceLink.setAttribute("href", "#sources");
+  const start = cell("section", "Start");
+  start.getBoundingClientRect = () => ({ left: 0, top: -900, right: 100, bottom: -800, width: 100, height: 100 });
+  const sources = cell("section", "Quellen");
+  sources.getBoundingClientRect = () => ({ left: 0, top: 120, right: 100, bottom: 220, width: 100, height: 100 });
+  sdk.setElementById("start", start);
+  sdk.setElementById("sources", sources);
+  sdk.setDocumentQueryAll((selector) => (selector.includes("href^='#'") ? [firstLink, sourceLink] : []));
+
+  sdk.runTimers();
+
+  assert.equal(firstLink.getAttribute("data-lavish-active-nav"), "false");
+  assert.equal(sourceLink.getAttribute("data-lavish-active-nav"), "true");
+  assert.equal(sourceLink.getAttribute("aria-current"), "location");
 });
 
 test("the served SDK bundle keeps the clicked element's own identity inside a table cell", () => {

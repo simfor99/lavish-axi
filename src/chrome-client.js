@@ -4,6 +4,7 @@ const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
+const sourceMarkdownPath = String(sessionData.sourceMarkdownPath || "");
 const queueStorageKey = "lavish-axi:queued:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
@@ -122,6 +123,9 @@ const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMen
 const reloadArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("reloadArtifact"));
 const copySnapshotButton = /** @type {HTMLButtonElement} */ (document.getElementById("copySnapshot"));
 const exportArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("exportArtifact"));
+const exportSourceMarkdownButton = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("exportSourceMarkdown")
+);
 const shareArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("shareArtifact"));
 const shareDialog = /** @type {HTMLDivElement} */ (document.getElementById("shareDialog"));
 const shareForm = /** @type {HTMLFormElement} */ (document.getElementById("shareForm"));
@@ -149,6 +153,15 @@ const endButton = /** @type {HTMLButtonElement} */ (document.getElementById("end
 const copyPathButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyPath"));
 const copyHint = /** @type {HTMLSpanElement} */ (document.getElementById("copyHint"));
 const copyHintText = /** @type {HTMLSpanElement} */ (document.getElementById("copyHintText"));
+const copySourceMarkdownPathButton = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("copySourceMarkdownPath")
+);
+const sourceMarkdownCopyHint = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("sourceMarkdownCopyHint")
+);
+const sourceMarkdownCopyHintText = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("sourceMarkdownCopyHintText")
+);
 const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("presenceBanner"));
 const handoffBanner = /** @type {HTMLDivElement} */ (document.getElementById("handoffBanner"));
 const handoffTakeoverButton = /** @type {HTMLButtonElement} */ (document.getElementById("handoffTakeover"));
@@ -180,7 +193,7 @@ const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
-let annotation = sessionData.initialAnnotate !== undefined ? Boolean(sessionData.initialAnnotate) : true;
+let annotation = sessionData.initialAnnotate !== undefined ? Boolean(sessionData.initialAnnotate) : false;
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";
@@ -212,6 +225,8 @@ let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionD
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
 const snapshotRequests = [];
+let pendingSubmitSnapshot = null;
+const SUBMIT_SNAPSHOT_WAIT_MS = 1500;
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
@@ -859,6 +874,40 @@ panelHead.addEventListener("click", () => {
   setSheetOpen(!sheetOpen);
 });
 panelScrim.addEventListener("click", () => setSheetOpen(false));
+// Desktop conversation panel collapse (2026-09-15): mirrors the mobile sheet toggle on
+// wide screens. Collapsing hides the column without unmounting it, so chat state and
+// the composer survive; the button stays docked to the frame edge for reopening.
+const desktopPanelStorageKey = "lavish-axi:panel-collapsed:" + key;
+function desktopPanelCollapsed() {
+  try {
+    return sessionStorage.getItem(desktopPanelStorageKey) === "1";
+  } catch {
+    return false;
+  }
+}
+function applyDesktopPanel() {
+  const collapsed = desktopPanelCollapsed();
+  document.body.classList.toggle("panel-collapsed", collapsed && !isMobileSheet());
+  panelToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  panelToggle.setAttribute("aria-label", collapsed ? "Show conversation" : "Hide conversation");
+}
+function setDesktopPanel(collapsed) {
+  try {
+    if (collapsed) sessionStorage.setItem(desktopPanelStorageKey, "1");
+    else sessionStorage.removeItem(desktopPanelStorageKey);
+  } catch {
+    // Storage unavailable: the class toggle below still applies for this view.
+  }
+  applyDesktopPanel();
+}
+panelToggle.addEventListener("click", (event) => {
+  if (isMobileSheet()) return; // below 861px the mobile sheet logic owns this button
+  event.stopPropagation();
+  setDesktopPanel(!desktopPanelCollapsed());
+});
+if (sheetMedia) sheetMedia.addEventListener("change", applyDesktopPanel);
+// Defer past the initial sheet-state derivation, which rewrites aria-expanded on desktop.
+setTimeout(applyDesktopPanel, 50);
 panelHead.addEventListener("pointerdown", (event) => {
   if (!isMobileSheet() || event.button) return;
   sheetDrag = { pointerId: event.pointerId, startY: Number(event.clientY), moved: false };
@@ -948,8 +997,26 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  snapshotRequests.push(action);
+  if (action === "submit" && pendingSubmitSnapshot) return;
+  const request = { action, settled: false, timer: undefined };
+  snapshotRequests.push(request);
+  if (action === "submit") {
+    pendingSubmitSnapshot = request;
+    request.timer = setTimeout(() => finishSubmitSnapshot(request, ""), SUBMIT_SNAPSHOT_WAIT_MS);
+    request.timer?.unref?.();
+  }
   postToFrame({ type: "lavish:requestSnapshot" });
+}
+
+function finishSubmitSnapshot(request, snapshot) {
+  if (request.settled) return;
+  request.settled = true;
+  clearTimeout(request.timer);
+  if (pendingSubmitSnapshot === request) pendingSubmitSnapshot = null;
+  if (ended || !queued.length) return;
+  // The snapshot is optional context. Already queued annotations must survive a silent SDK.
+  pendingSnapshot = snapshot;
+  submitQueued().catch(() => {});
 }
 
 function createChatAttachmentsController() {
@@ -1198,6 +1265,10 @@ async function submitQueued() {
     const result = await submitQueuedPromise;
     succeeded = result !== false;
     return result;
+  } catch (error) {
+    if (sendHint.hidden)
+      showSendHint("Lavish could not send your feedback. It is still queued. Try Send to Agent again.", 6000);
+    throw error;
   } finally {
     submitQueuedPromise = null;
     const shouldSubmitAgain = submitQueuedAgain;
@@ -1220,11 +1291,28 @@ async function submitQueuedOnce() {
   const shouldEndSession = endAfterSubmit;
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
   if (shouldEndSession) body.endSession = true;
-  const response = await fetch("/api/" + key + "/prompts", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  timeout?.unref?.();
+  let response;
+  try {
+    response = await fetch("/api/" + key + "/prompts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      showSendHint(
+        "Delivery is not confirmed. Your notes remain queued. Other open review tabs may block the connection. Check for a receipt before retrying.",
+        30000,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!response.ok) {
     if (response.status === 409) {
       const data = await response.json().catch(() => null);
@@ -1237,6 +1325,10 @@ async function submitQueuedOnce() {
         return false;
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
+      showSendHint(
+        "Lavish could not send your feedback because the review changed. It is still queued. Review it and try again.",
+        6000,
+      );
       endAfterSubmit = false;
       return false;
     }
@@ -1844,6 +1936,17 @@ function copyFilePath() {
   }, 1600);
 }
 
+function copySourceMarkdownPath() {
+  if (!sourceMarkdownPath || !sourceMarkdownCopyHint || !sourceMarkdownCopyHintText) return;
+  copyText(sourceMarkdownPath);
+  sourceMarkdownCopyHint.classList.add("copied");
+  sourceMarkdownCopyHintText.textContent = "Copied";
+  setTimeout(() => {
+    sourceMarkdownCopyHint.classList.remove("copied");
+    sourceMarkdownCopyHintText.textContent = "Copy";
+  }, 1600);
+}
+
 function copyDomSnapshot() {
   closeMenus();
   requestSnapshot("copy");
@@ -1852,6 +1955,10 @@ function copyDomSnapshot() {
 function exportFileName() {
   const base = (filePath.split(/[\\/]/).pop() || "artifact.html").replace(/\.html?$/i, "");
   return (base || "artifact") + ".export.html";
+}
+
+function sourceMarkdownExportFileName() {
+  return sourceMarkdownPath.split(/[\\/]/).pop() || "source.md";
 }
 
 function setExportLabel(text) {
@@ -1904,6 +2011,32 @@ async function exportArtifact() {
     setExportLabel("Export failed - retry");
   } finally {
     exportArtifactButton.disabled = false;
+  }
+}
+
+async function exportSourceMarkdown() {
+  if (!exportSourceMarkdownButton) return;
+  const label = exportSourceMarkdownButton.querySelector("span");
+  exportSourceMarkdownButton.disabled = true;
+  if (label) label.textContent = "Exporting source Markdown...";
+  try {
+    const response = await fetch("/api/" + key + "/source-markdown");
+    if (!response.ok) throw new Error("source Markdown export failed");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = sourceMarkdownExportFileName();
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    if (label) label.textContent = "Export source Markdown";
+    closeMenus();
+  } catch {
+    if (label) label.textContent = "Markdown export failed - retry";
+  } finally {
+    exportSourceMarkdownButton.disabled = false;
   }
 }
 
@@ -2744,9 +2877,8 @@ window.addEventListener("message", (event) => {
 
 function loadFrame() {
   if (artifactSrc) {
-    if (artifactLoadToken) {
-      frame.src = artifactFrameSrcForLoad({ revision: artifactLoadRevision, token: artifactLoadToken });
-    }
+    // The inherited token can expire as soon as this chrome begins its own load.
+    // Navigate only once that load has actually been accepted.
     replaceArtifactFrame().catch(() => {});
   }
 }
@@ -2931,15 +3063,12 @@ window.addEventListener("message", (event) => {
     pulseSheetDock();
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
-    if (snapshotAction === "copy") {
+    const request = snapshotRequests.shift();
+    if (!request || request.settled) return;
+    if (request.action === "copy") {
       copyText(msg.snapshot || "");
     } else {
-      pendingSnapshot = msg.snapshot || "";
-      // submitQueuedOnce throws to signal "nothing was delivered" - its own
-      // finally already reset the end intent and it left the queue intact for a
-      // retry, so the rejection has no remaining consumer here.
-      submitQueued().catch(() => {});
+      finishSubmitSnapshot(request, msg.snapshot || "");
     }
   }
   if (msg.type === "lavish:scroll") {
@@ -3201,9 +3330,11 @@ chatInput.addEventListener("keydown", (event) => {
 });
 chatInput.addEventListener("input", hideSendHint);
 copyPathButton.onclick = copyFilePath;
+if (copySourceMarkdownPathButton) copySourceMarkdownPathButton.onclick = copySourceMarkdownPath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
 exportArtifactButton.onclick = exportArtifact;
+if (exportSourceMarkdownButton) exportSourceMarkdownButton.onclick = exportSourceMarkdown;
 shareArtifactButton.onclick = openShareDialog;
 shareCloseButton.onclick = closeShareDialog;
 shareCancelButton.onclick = closeShareDialog;
@@ -3278,27 +3409,52 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
-const events = new EventSource("/events/" + key);
-events.addEventListener("reload", () => {
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
+let events = null;
+function connectEvents() {
+  if (events || document.hidden) return;
+  events = new EventSource("/events/" + key);
+  events.addEventListener("reload", () => {
+    resetFrame().then((reloaded) => {
+      if (reloaded) refreshWhiteboardSource();
+    });
   });
+  events.addEventListener("chrome-reload", (event) => reloadAfterServerRestart(shutdownEventReason(event)));
+  // The replacement server serves a different artifact's review. This page keeps working against
+  // it; it is only running the previous version of the chrome, which is the user's to act on.
+  events.addEventListener("chrome-outdated", (event) => setChromeOutdated(true, shutdownEventReason(event)));
+  events.addEventListener("agent-reply", (event) => {
+    const text = JSON.parse(event.data).text;
+    addChat("agent", text);
+    noteAgentReply(text);
+  });
+  events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
+  events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
+  events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
+  events.addEventListener("ended", () => markSessionEnded());
+  // A reconnecting stream means this chrome may have missed updates while it was away.
+  events.addEventListener("open", () => refreshLayoutWarnings());
+}
+
+function disconnectEvents() {
+  events?.close();
+  events = null;
+}
+
+// HTTP/1 browsers share a small socket pool across every tab on this origin.
+// Idle background SSE streams can occupy it completely and strand feedback POSTs.
+// Reattachment receives canonical chat, presence and ended state from the server.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    disconnectEvents();
+  } else {
+    connectEvents();
+    // A hidden tab may have missed an artifact reload. Existing reset preserves drafts.
+    if (!ended) resetFrame();
+  }
 });
-events.addEventListener("chrome-reload", (event) => reloadAfterServerRestart(shutdownEventReason(event)));
-// The replacement server serves a different artifact's review. This page keeps working against
-// it; it is only running the previous version of the chrome, which is the user's to act on.
-events.addEventListener("chrome-outdated", (event) => setChromeOutdated(true, shutdownEventReason(event)));
-events.addEventListener("agent-reply", (event) => {
-  const text = JSON.parse(event.data).text;
-  addChat("agent", text);
-  noteAgentReply(text);
-});
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
-events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
-events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
-events.addEventListener("ended", () => markSessionEnded());
-// A reconnecting stream means this chrome may have missed updates while it was away.
-events.addEventListener("open", () => refreshLayoutWarnings());
+window.addEventListener("pagehide", disconnectEvents);
+window.addEventListener("pageshow", connectEvents);
+connectEvents();
 
 applySheetState();
 render();

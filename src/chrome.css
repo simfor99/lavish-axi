@@ -1689,3 +1689,55 @@ body.layout-gate-active iframe#artifact {
 .whiteboard-error[hidden] {
   display: none;
 }
+/* Desktop conversation panel collapse (2026-09-15): below 861px the mobile sheet
+   dock owns the toggle; on wide screens the same button docks to the panel's left
+   edge and collapses the column without unmounting it, so chat state survives.
+   The panel keeps its children in the tree (visibility, not display), because
+   overflow clipping on .panel would also clip the docked toggle at left:-17px. */
+@media (min-width: 861px) {
+  .layout {
+    transition: grid-template-columns var(--dur-slow) var(--ease);
+  }
+  body.panel-collapsed .layout {
+    grid-template-columns: minmax(0, 1fr) 0;
+  }
+  .panel {
+    position: relative;
+    transition: width var(--dur-slow) var(--ease);
+  }
+  .panel-toggle {
+    display: flex;
+    position: absolute;
+    left: -17px;
+    top: 14px;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    z-index: 30;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--bg-elevated);
+    color: var(--fg-muted);
+    cursor: pointer;
+    box-shadow: var(--shadow-floating);
+  }
+  .panel-toggle svg {
+    display: block;
+    transition: transform var(--dur) var(--ease);
+  }
+  body.panel-collapsed .panel {
+    width: 0;
+    border-left: 0;
+  }
+  body.panel-collapsed .panel-toggle {
+    left: -34px;
+  }
+  body.panel-collapsed .panel > *:not(.panel-head) {
+    visibility: hidden;
+  }
+  body.panel-collapsed .panel-toggle svg {
+    transform: rotate(180deg);
+  }
+}

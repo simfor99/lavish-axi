@@ -148,7 +148,7 @@ export const DESIGN_PRIORITY_RULE =
 export const DESIGN_SYSTEM_HINT =
   "Lavish does not auto-inject any design system - artifacts stay portable so they render identically when opened directly without lavish-axi running. Before writing any HTML: " +
   DESIGN_PRIORITY_RULE +
-  " Run `lavish-axi design` for a content-to-playbook router, a copy-pasteable CDN snippet, the whiteboard (Mermaid) opt-in snippet, and the DaisyUI component reference. When you deliver the artifact, state which of the three design sources you used and why.";
+  " Run `lavish-axi design` for a content-to-playbook router, a copy-pasteable CDN snippet, the whiteboard (Mermaid) opt-in snippet, and the DaisyUI component reference. Reviews open in explore mode by default even when a link omits `?annotate=off`; use `?annotate=on` only for an explicit left-click annotation workflow, and mark custom links or actions with `data-lavish-action` so they remain native. When you deliver the artifact, state which of the three design sources you used and why.";
 
 export const DAISYUI_THEMES = [
   "light",
