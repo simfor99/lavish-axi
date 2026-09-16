@@ -11,12 +11,13 @@ const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
 // that stopped declaring one would leave the corresponding feature silently dead behind an
 // `if (element)` guard - a harness that invents an element for any id would never notice.
 const servedChromeIds = new Set(
-  [...createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }).matchAll(/\sid="([^"]+)"/g)].map(
-    (match) => match[1],
-  ),
+  [
+    createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }),
+    createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { sourceMarkdownPath: "/tmp/artifact.md" }),
+  ].flatMap((html) => [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1])),
 );
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, sourceMarkdownPath?: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialAnnotate?: boolean, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -2014,6 +2015,26 @@ test("chrome client surfaces export notices from the server response", async () 
   await flushPromises();
 
   assert.equal(chrome.element("exportArtifact").querySelector("span").textContent, "Exported with 1 notice");
+});
+
+test("chrome client downloads the source Markdown that the report bound to its session", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, sourceMarkdownPath: "/tmp/artifact.md" },
+    fetchImpl: async (url) => {
+      requests.push(String(url));
+      return {
+        ok: true,
+        blob: async () => ({}),
+      };
+    },
+  });
+
+  await chrome.element("exportSourceMarkdown").onclick();
+  await flushPromises();
+
+  assert.deepEqual(requests, ["/api/abc/source-markdown"]);
+  assert.equal(chrome.element("exportSourceMarkdown").querySelector("span").textContent, "Export source Markdown");
 });
 
 test("chrome client includes export notices alongside unresolved assets", async () => {
@@ -4271,7 +4292,7 @@ test("a queued Send refused because the session already ended marks the chrome r
 });
 
 test("Cmd/Ctrl+I toggles annotation mode from the chrome document, regardless of focus", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   const metaEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
   assert.equal(metaEvent.defaultPrevented, true);
@@ -4310,9 +4331,24 @@ test("plain 'i' and other modifier combos do not toggle annotation mode", async 
   assert.equal(framePostCount(), before);
 });
 
+test("chrome defaults to explore mode when a legacy session bootstrap omits the mode", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" },
+  });
+
+  // The harness does not parse the generated button attributes; a first toggle to true is the
+  // observable proof that the omitted bootstrap value started in Explore mode.
+  assert.equal(chrome.element("annotation")["aria-pressed"], undefined);
+  const event = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(chrome.element("annotation")["aria-pressed"], "true");
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:setAnnotationMode");
+  assert.equal(chrome.postedToFrame.at(-1).enabled, true);
+});
+
 test("chrome client reads the mode toggle hotkey from the session bootstrap", async () => {
   const chrome = await createChromeHarness({
-    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "k" },
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "k", initialAnnotate: true },
   });
 
   const oldHotkeyEvent = chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
@@ -4327,7 +4363,7 @@ test("chrome client reads the mode toggle hotkey from the session bootstrap", as
 });
 
 test("chrome client toggles annotation mode when the artifact SDK requests it via postMessage", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   chrome.sendFrameMessage({ type: "lavish:toggleAnnotationMode" });
 
@@ -4342,7 +4378,7 @@ test("chrome client toggles annotation mode when the artifact SDK requests it vi
 });
 
 test("chrome client ignores annotation mode toggles after the session ends", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialAnnotate: true } });
 
   chrome.dispatchDocumentKeydown({ key: "i", metaKey: true });
   assert.equal(chrome.element("annotation")["aria-pressed"], "false");

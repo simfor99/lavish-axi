@@ -20,6 +20,7 @@ import {
   createSdkJs,
   displayPathParts,
   exportContentDisposition,
+  extractArtifactMarkdownSourceReference,
   extractArtifactHead,
   hasLiveReloadRootOptIn,
   hostnameFromHostHeader,
@@ -801,7 +802,7 @@ test("annotation card shadow styles use Lavish design-system variables", () => {
 test("chrome top bar uses an Annotate switch instead of a labeled toggle button", () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
 
-  assert.match(html, /class="annotate-switch" id="annotation"[^>]*aria-pressed="true"/);
+  assert.match(html, /class="annotate-switch" id="annotation"[^>]*aria-pressed="false"/);
   assert.match(html, /class="switch-track"/);
   assert.match(html, />Annotate</);
   assert.doesNotMatch(html, /Annotation: On/);
@@ -965,6 +966,46 @@ test("overflow menu offers a standalone HTML export that downloads a portable fi
   assert.match(js, /exportArtifactButton\.onclick = exportArtifact/);
 });
 
+test("overflow menu exposes a bound Markdown source only when the report declares a safe relative source", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { sourceMarkdownPath: "/tmp/artifact.md" });
+  const withoutSource = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const js = await chromeClientSource();
+
+  assert.match(html, /id="copySourceMarkdownPath"/);
+  assert.match(html, /id="exportSourceMarkdown"[^<]*>.*Export source Markdown/);
+  assert.match(html, /sourceMarkdownPath.*artifact\.md/);
+  assert.doesNotMatch(withoutSource, /copySourceMarkdownPath|exportSourceMarkdown/);
+  assert.match(js, /async function exportSourceMarkdown/);
+  assert.match(js, /"\/source-markdown"/);
+  assert.match(js, /copySourceMarkdownPathButton\.onclick = copySourceMarkdownPath/);
+});
+
+test("bound Markdown references accept only relative Markdown files inside the artifact directory", () => {
+  assert.equal(
+    extractArtifactMarkdownSourceReference('<meta name="source-markdown-path" content="report.md">'),
+    "report.md",
+  );
+  assert.equal(
+    extractArtifactMarkdownSourceReference('<meta content="notes/decision.MD" name="source-markdown-path">'),
+    "notes/decision.MD",
+  );
+  assert.equal(
+    extractArtifactMarkdownSourceReference('<meta name="source-markdown-path" content="../outside.md">'),
+    "",
+  );
+  assert.equal(
+    extractArtifactMarkdownSourceReference('<meta name="source-markdown-path" content="/tmp/outside.md">'),
+    "",
+  );
+  assert.equal(extractArtifactMarkdownSourceReference('<meta name="source-markdown-path" content="report.html">'), "");
+  assert.equal(
+    extractArtifactMarkdownSourceReference(
+      `<html><head><style>${"x".repeat(12000)}</style><meta name="source-markdown-path" content="report.md"></head></html>`,
+    ),
+    "report.md",
+  );
+});
+
 test("overflow menu offers publishing an ht-ml.app link via a share dialog", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const js = await chromeClientSource();
@@ -1037,8 +1078,8 @@ test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard
 
   assert.match(js, /const snapshotRequests = \[\]/);
   assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /const snapshotAction = snapshotRequests\.shift\(\) \|\| "submit"/);
-  assert.match(js, /if \(snapshotAction === "copy"\)/);
+  assert.match(js, /const request = snapshotRequests\.shift\(\)/);
+  assert.match(js, /if \(request\.action === "copy"\)/);
   assert.match(js, /copyText\(msg\.snapshot \|\| ""\)/);
 });
 
@@ -2852,6 +2893,25 @@ test("begin-load requires the current chrome handoff before any first or direct 
     assert.match(await directArtifact.text(), /Artifact load expired/);
     const revision = await fetch(`${base}/api/${key}/layout-warnings`).then((response) => response.json());
     assert.equal(revision.revision, firstLoad.artifact_revision);
+
+    const directExplicit = await fetch(`${base}/artifact/${key}/index.html?direct=1`);
+    assert.equal(directExplicit.status, 200);
+    assert.match(await directExplicit.text(), /direct/);
+
+    // A normal top-level browser navigation carries this Fetch Metadata header. It is the
+    // suffix-free path used by the linked artifact, and it must still get the portable artifact
+    // plus the SDK's Explore default.
+    const directBrowser = await fetch(`${base}/artifact/${key}/index.html`, {
+      headers: { "sec-fetch-dest": "document" },
+    });
+    assert.equal(directBrowser.status, 200);
+    const directBrowserHtml = await directBrowser.text();
+    assert.match(directBrowserHtml, /src="\/sdk\.js\?key=/);
+    const sdkSrc = directBrowserHtml.match(/src="(\/sdk\.js[^"]*)"/);
+    assert.ok(sdkSrc);
+    const directSdk = await fetch(`${base}${sdkSrc[1]}`);
+    assert.equal(directSdk.status, 200);
+    assert.match(await directSdk.text(), /"initialAnnotate":false/);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -3550,6 +3610,66 @@ test("GET /api/:key/export returns 404 for an unknown session", async () => {
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/source-markdown downloads the declared sibling Markdown source", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-markdown-source-"));
+  const artifact = path.join(dir, "report.html");
+  const source = path.join(dir, "report.md");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><meta name="source-markdown-path" content="report.md"></head><body><h1>Report</h1></body></html>',
+  );
+  await writeFile(source, "# Original report\n\nEvidence stays bound.\n");
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const markdownRes = await fetch(`${base}/api/${session.key}/source-markdown`);
+    assert.equal(markdownRes.status, 200);
+    assert.equal(markdownRes.headers.get("content-type"), "text/markdown; charset=utf-8");
+    assert.match(markdownRes.headers.get("content-disposition") || "", /attachment; filename="report\.md"/);
+    assert.equal(await markdownRes.text(), "# Original report\n\nEvidence stays bound.\n");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/:key/source-markdown refuses a traversal reference", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-markdown-source-"));
+  const artifact = path.join(dir, "report.html");
+  const outside = path.join(path.dirname(dir), "outside.md");
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><meta name="source-markdown-path" content="../outside.md"></head><body></body></html>',
+  );
+  await writeFile(outside, "do not expose");
+
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    const markdownRes = await fetch(`${base}/api/${session.key}/source-markdown`);
+    assert.equal(markdownRes.status, 404);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { force: true });
   }
 });
 
@@ -6078,7 +6198,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html\?annotate=off"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);
@@ -6256,8 +6376,8 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
 });
 
 test("resolveInitialAnnotateMode respects query params and environment variables", () => {
-  // Defaults to true when unconfigured
-  assert.equal(resolveInitialAnnotateMode({}, {}), true);
+  // Explore is the safe default when no mode was specified.
+  assert.equal(resolveInitialAnnotateMode({}, {}), false);
 
   // Query parameter annotate=off / false / explore
   assert.equal(resolveInitialAnnotateMode({ annotate: "off" }, {}), false);
@@ -6290,6 +6410,9 @@ test("createChromeHtml renders initialAnnotate on switch, session script and ifr
 });
 
 test("createSdkJs passes initialAnnotate into artifact SDK options", () => {
+  const defaultJs = createSdkJs("abc");
+  assert.match(defaultJs, /"initialAnnotate":false/);
+
   const onJs = createSdkJs("abc", 0, "token", { initialAnnotate: true });
   assert.match(onJs, /"initialAnnotate":true/);
 

@@ -532,6 +532,7 @@ export async function serve({
   });
 
   app.get("/health", async (req, res) => {
+    res.setHeader("access-control-allow-origin", "*");
     if (!serverReady) {
       res.status(503).json({ ok: false, app: "lavish-axi", version });
       return;
@@ -722,8 +723,16 @@ export async function serve({
   // reaches the agent as the user's own instructions. The session key is derived
   // from the artifact path, not a secret, so knowing it must not be enough -
   // only this server's own chrome may queue prompts.
+  app.options("/api/:key/prompts", (_req, res) => {
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("access-control-allow-headers", "content-type");
+    res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+    res.sendStatus(204);
+  });
+
   app.post("/api/:key/prompts", async (req, res, next) => {
     try {
+      res.setHeader("access-control-allow-origin", "*");
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin prompt submission rejected" });
         return;
@@ -937,6 +946,29 @@ export async function serve({
     }
   });
 
+  // A report may bind an authored Markdown source through a relative metadata reference. The
+  // reference remains confined to the artifact directory, so opening a report cannot turn this
+  // endpoint into a general filesystem reader.
+  app.get("/api/:key/source-markdown", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const artifactHtml = await readFile(session.file, "utf8");
+      const markdownSource = await readArtifactMarkdownSource(session.file, artifactHtml);
+      if (!markdownSource) {
+        res.status(404).json({ error: "source Markdown is unavailable" });
+        return;
+      }
+      res.setHeader("content-disposition", sourceMarkdownContentDisposition(markdownSource.file));
+      res.type("text/markdown").send(markdownSource.content);
+    } catch (error) {
+      next(error);
+    }
+  });
+
   // Hosted share: build the local-inlined artifact and publish it to ht-ml.app, a third-party
   // hosting service not part of Lavish, returning the share URL. Publishing sends the artifact
   // to ht-ml.app's servers. Remote CDN/font references are left intact for the viewer's browser
@@ -1045,6 +1077,7 @@ export async function serve({
       const session = chromeLoad.session;
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
       const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
+      const markdownSource = await readArtifactMarkdownSource(session.file, artifactHtml);
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
       // Nothing legitimately frames the review chrome - it is the top-level
       // page, and shares/exports ship standalone HTML rather than embedding it.
@@ -1068,6 +1101,7 @@ export async function serve({
           attachmentMaxBytes: attachmentConfig.maxBytes,
           attachmentMaxCount: attachmentConfig.maxPerPrompt,
           initialAnnotate,
+          sourceMarkdownPath: markdownSource?.file || "",
         }),
       );
     } catch (error) {
@@ -1124,7 +1158,19 @@ export async function serve({
 
   app.get(/^\/artifact\/([^/]+)\/index\.html$/, async (req, res, next) => {
     try {
-      res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
+      const isExplicitDirect =
+        req.query.direct === "1" ||
+        req.query.direct === "true" ||
+        req.query.standalone === "true" ||
+        req.get("sec-fetch-dest") === "document";
+      if (isExplicitDirect) {
+        res.setHeader(
+          "content-security-policy",
+          "sandbox allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
+        );
+      } else {
+        res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
+      }
       const key = req.params[0];
       const token = String(req.query.artifact_load_token || "");
       const revision = req.query.artifact_revision;
@@ -1133,7 +1179,7 @@ export async function serve({
         sendSessionNotFound(req, res);
         return;
       }
-      if (!beforeRead.valid) {
+      if (!beforeRead.valid && !isExplicitDirect) {
         res
           .status(409)
           .type("html")
@@ -1144,7 +1190,7 @@ export async function serve({
       }
       const html = await readFile(beforeRead.session.file, "utf8");
       const verified = await store.verifyArtifactLoad(key, token, revision);
-      if (!verified?.valid) {
+      if (!verified?.valid && !isExplicitDirect) {
         res
           .status(409)
           .type("html")
@@ -1153,7 +1199,17 @@ export async function serve({
           );
         return;
       }
-      res.type("html").send(injectLavishSdk(html, key, verified.artifact_revision, verified.artifact_load_token));
+      res
+        .type("html")
+        .send(
+          injectLavishSdk(
+            html,
+            key,
+            verified?.artifact_revision ?? beforeRead.artifact_revision,
+            verified?.artifact_load_token ?? beforeRead.artifact_load_token,
+            { initialAnnotate: resolveInitialAnnotateMode(req.query || {}, process.env) },
+          ),
+        );
     } catch (error) {
       next(error);
     }
@@ -1858,6 +1914,14 @@ export function resolveDesignAssetPath(refPath) {
 
 export function exportContentDisposition(file) {
   const filename = exportFileName(file);
+  return contentDispositionForFilename(filename);
+}
+
+export function sourceMarkdownContentDisposition(file) {
+  return contentDispositionForFilename(path.basename(file));
+}
+
+function contentDispositionForFilename(filename) {
   return `attachment; filename="${sanitizeDispositionFilename(filename)}"; filename*=UTF-8''${encodeRfc5987Value(filename)}`;
 }
 
@@ -1897,6 +1961,13 @@ export function buildAllowedHostnames({ host, hosts = [], linkHost: linkHostName
 // allowlist, for operators who front the server with their own auth/proxy.
 export function allowsAllHosts(allowedHosts = []) {
   return allowedHosts.some((value) => String(value).trim() === "*");
+}
+
+function isLoopbackHostname(value) {
+  const hostname = String(value || "")
+    .trim()
+    .toLowerCase();
+  return hostname === LOOPBACK_HOST || hostname === IPV6_LOOPBACK_HOST || hostname === "localhost";
 }
 
 function parseHostAuthority(value) {
@@ -2003,6 +2074,9 @@ function isSameOriginRequest(req, allowedHostnames, allowAnyHostname = false) {
   if (!expectedOrigin) return false;
   const origin = req.get("origin");
   if (origin) {
+    if (origin === "null" && isLoopbackHostname(authority.hostname)) {
+      return true;
+    }
     return normalizeOrigin(origin) === expectedOrigin;
   }
   const referer = req.get("referer");
@@ -2260,8 +2334,14 @@ export function resolveInitialAnnotateMode(query = {}, env = process.env) {
   if (envVal === "off" || envVal === "false" || envVal === "0" || envVal === "explore") {
     return false;
   }
+  if (envVal === "on" || envVal === "true" || envVal === "1" || envVal === "annotate") {
+    return true;
+  }
 
-  return true;
+  // Explore is the safe default for a link that omitted the optional query
+  // parameter. Reviewers can still opt into left-click annotation explicitly
+  // with `?annotate=on` (or via LAVISH_AXI_ANNOTATE_DEFAULT=on).
+  return false;
 }
 
 function shouldDisableLayoutGateOpen(body = {}) {
@@ -2337,6 +2417,37 @@ export function extractArtifactHead(html) {
   return { faviconTag, title };
 }
 
+// Markdown provenance is authored by the report renderer, not inferred from an HTML filename.
+// Only a relative .md reference is eligible, then readArtifactMarkdownSource applies the same
+// lexical and realpath confinement used for sibling assets.
+export function extractArtifactMarkdownSourceReference(html) {
+  const documentText = String(html || "");
+  const headClose = documentText.search(/<\/head\s*>/i);
+  // Report renderers often place their provenance metadata after a substantial inlined stylesheet.
+  // Read the actual head rather than an arbitrary short prefix, while retaining a bounded fallback
+  // for malformed documents that never close a head element.
+  const head = documentText.slice(0, headClose >= 0 ? headClose : 262144);
+  const metaTags = head.match(/<meta\b(?:"[^"]*"|'[^']*'|[^"'>])*>/gi) || [];
+  const sourceTag = metaTags.find((tag) => readTagAttr(tag, "name").toLowerCase() === "source-markdown-path");
+  const reference = sourceTag ? readTagAttr(sourceTag, "content") : "";
+  if (!reference || !/\.md$/i.test(reference) || path.isAbsolute(reference)) return "";
+  const segments = reference.split(/[\\/]+/);
+  if (segments.some((segment) => segment === "..")) return "";
+  return reference;
+}
+
+async function readArtifactMarkdownSource(artifactFile, artifactHtml) {
+  const reference = extractArtifactMarkdownSourceReference(artifactHtml);
+  if (!reference) return null;
+  const file = await resolveArtifactAsset(path.dirname(artifactFile), reference);
+  if (!file || !/\.md$/i.test(file)) return null;
+  try {
+    return { file, content: await readFile(file, "utf8") };
+  } catch {
+    return null;
+  }
+}
+
 // The chrome page ships with the layout-gate overlay already covering the artifact area. Install
 // its bounded escape and manual bypass inline before `chrome-client.js`, so they still work if the
 // shared server shuts down between serving the page and serving that script. This block also arms
@@ -2403,7 +2514,8 @@ export function createChromeHtml(
     attachmentMaxBytes = 0,
     attachmentMaxCount = 0,
     attachmentAcceptedMime = ACCEPTED_IMAGE_MIME,
-    initialAnnotate = true,
+    initialAnnotate = false,
+    sourceMarkdownPath = "",
   } = {},
 ) {
   const acceptedMime = attachmentAcceptedMime.map(String);
@@ -2429,8 +2541,13 @@ export function createChromeHtml(
     attachmentMaxBytes,
     attachmentMaxCount,
     attachmentAcceptedMime: acceptedMime,
+    sourceMarkdownPath,
   });
   const { head: pathHead, tail: pathTail } = displayPathParts(session.file);
+  const sourceMarkdownParts = sourceMarkdownPath ? displayPathParts(sourceMarkdownPath) : null;
+  const sourceMarkdownMenu = sourceMarkdownParts
+    ? `<div class="menu-rule"></div><div class="menu-head"><div class="menu-label">Source Markdown</div><button class="menu-file" id="copySourceMarkdownPath" type="button" title="Copy Markdown path · ${escapeHtml(sourceMarkdownPath)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(sourceMarkdownParts.head)}</span><span class="path-tail">${escapeHtml(sourceMarkdownParts.tail)}</span></span><span class="copy-hint" id="sourceMarkdownCopyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="sourceMarkdownCopyHintText">Copy</span></span></button></div><button class="menu-item" id="exportSourceMarkdown" type="button">${chromeIcons.download}<span>Export source Markdown</span></button>`
+    : "";
   const bodyClass = layoutGateEnabled ? "lavish layout-gate-active" : "lavish";
   const layoutGateHidden = layoutGateEnabled ? "" : " hidden";
   const modeHotkeyUpper = MODE_TOGGLE_HOTKEY_KEY.toUpperCase();
@@ -2445,7 +2562,7 @@ ${faviconTag}
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="${initialAnnotate ? "true" : "false"}" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="${initialAnnotate ? "true" : "false"}" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div>${sourceMarkdownMenu}<div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html${initialAnnotate ? "" : "?annotate=off"}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
@@ -2505,7 +2622,7 @@ export function createSdkJs(
   key,
   artifactRevision = 0,
   artifactLoadToken = "",
-  { maxAttachmentCount, maxAttachmentBytes, acceptedImageMime = ACCEPTED_IMAGE_MIME, initialAnnotate = true } = {},
+  { maxAttachmentCount, maxAttachmentBytes, acceptedImageMime = ACCEPTED_IMAGE_MIME, initialAnnotate = false } = {},
 ) {
   const mermaidHelperSource = serializeModuleHelpers(mermaidNode);
   const tableHelperSource = serializeModuleHelpers(tableCellHelpers);

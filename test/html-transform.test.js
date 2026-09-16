@@ -41,3 +41,8 @@ test("carries the per-load token into the SDK request", () => {
 
   assert.match(result, /sdk\.js\?key=abc123&artifact_revision=7&artifact_load_token=load%20token%2F7/);
 });
+
+test("carries an explicit annotate-on mode into the injected SDK request", () => {
+  const result = injectLavishSdk("<body></body>", "abc123", 7, "load token", { initialAnnotate: true });
+  assert.match(result, /src="\/sdk\.js\?key=abc123&artifact_revision=7&artifact_load_token=load%20token&annotate=on"/);
+});

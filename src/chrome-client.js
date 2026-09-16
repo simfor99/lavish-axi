@@ -4,6 +4,7 @@ const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
+const sourceMarkdownPath = String(sessionData.sourceMarkdownPath || "");
 const queueStorageKey = "lavish-axi:queued:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
@@ -122,6 +123,9 @@ const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMen
 const reloadArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("reloadArtifact"));
 const copySnapshotButton = /** @type {HTMLButtonElement} */ (document.getElementById("copySnapshot"));
 const exportArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("exportArtifact"));
+const exportSourceMarkdownButton = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("exportSourceMarkdown")
+);
 const shareArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("shareArtifact"));
 const shareDialog = /** @type {HTMLDivElement} */ (document.getElementById("shareDialog"));
 const shareForm = /** @type {HTMLFormElement} */ (document.getElementById("shareForm"));
@@ -149,6 +153,15 @@ const endButton = /** @type {HTMLButtonElement} */ (document.getElementById("end
 const copyPathButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyPath"));
 const copyHint = /** @type {HTMLSpanElement} */ (document.getElementById("copyHint"));
 const copyHintText = /** @type {HTMLSpanElement} */ (document.getElementById("copyHintText"));
+const copySourceMarkdownPathButton = /** @type {HTMLButtonElement | null} */ (
+  document.getElementById("copySourceMarkdownPath")
+);
+const sourceMarkdownCopyHint = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("sourceMarkdownCopyHint")
+);
+const sourceMarkdownCopyHintText = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("sourceMarkdownCopyHintText")
+);
 const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("presenceBanner"));
 const handoffBanner = /** @type {HTMLDivElement} */ (document.getElementById("handoffBanner"));
 const handoffTakeoverButton = /** @type {HTMLButtonElement} */ (document.getElementById("handoffTakeover"));
@@ -180,7 +193,7 @@ const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
-let annotation = sessionData.initialAnnotate !== undefined ? Boolean(sessionData.initialAnnotate) : true;
+let annotation = sessionData.initialAnnotate !== undefined ? Boolean(sessionData.initialAnnotate) : false;
 let ended = false;
 let agentPresence = "waiting";
 let pendingSnapshot = "";
@@ -861,6 +874,40 @@ panelHead.addEventListener("click", () => {
   setSheetOpen(!sheetOpen);
 });
 panelScrim.addEventListener("click", () => setSheetOpen(false));
+// Desktop conversation panel collapse (2026-09-15): mirrors the mobile sheet toggle on
+// wide screens. Collapsing hides the column without unmounting it, so chat state and
+// the composer survive; the button stays docked to the frame edge for reopening.
+const desktopPanelStorageKey = "lavish-axi:panel-collapsed:" + key;
+function desktopPanelCollapsed() {
+  try {
+    return sessionStorage.getItem(desktopPanelStorageKey) === "1";
+  } catch {
+    return false;
+  }
+}
+function applyDesktopPanel() {
+  const collapsed = desktopPanelCollapsed();
+  document.body.classList.toggle("panel-collapsed", collapsed && !isMobileSheet());
+  panelToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  panelToggle.setAttribute("aria-label", collapsed ? "Show conversation" : "Hide conversation");
+}
+function setDesktopPanel(collapsed) {
+  try {
+    if (collapsed) sessionStorage.setItem(desktopPanelStorageKey, "1");
+    else sessionStorage.removeItem(desktopPanelStorageKey);
+  } catch {
+    // Storage unavailable: the class toggle below still applies for this view.
+  }
+  applyDesktopPanel();
+}
+panelToggle.addEventListener("click", (event) => {
+  if (isMobileSheet()) return; // below 861px the mobile sheet logic owns this button
+  event.stopPropagation();
+  setDesktopPanel(!desktopPanelCollapsed());
+});
+if (sheetMedia) sheetMedia.addEventListener("change", applyDesktopPanel);
+// Defer past the initial sheet-state derivation, which rewrites aria-expanded on desktop.
+setTimeout(applyDesktopPanel, 50);
 panelHead.addEventListener("pointerdown", (event) => {
   if (!isMobileSheet() || event.button) return;
   sheetDrag = { pointerId: event.pointerId, startY: Number(event.clientY), moved: false };
@@ -1889,6 +1936,17 @@ function copyFilePath() {
   }, 1600);
 }
 
+function copySourceMarkdownPath() {
+  if (!sourceMarkdownPath || !sourceMarkdownCopyHint || !sourceMarkdownCopyHintText) return;
+  copyText(sourceMarkdownPath);
+  sourceMarkdownCopyHint.classList.add("copied");
+  sourceMarkdownCopyHintText.textContent = "Copied";
+  setTimeout(() => {
+    sourceMarkdownCopyHint.classList.remove("copied");
+    sourceMarkdownCopyHintText.textContent = "Copy";
+  }, 1600);
+}
+
 function copyDomSnapshot() {
   closeMenus();
   requestSnapshot("copy");
@@ -1897,6 +1955,10 @@ function copyDomSnapshot() {
 function exportFileName() {
   const base = (filePath.split(/[\\/]/).pop() || "artifact.html").replace(/\.html?$/i, "");
   return (base || "artifact") + ".export.html";
+}
+
+function sourceMarkdownExportFileName() {
+  return sourceMarkdownPath.split(/[\\/]/).pop() || "source.md";
 }
 
 function setExportLabel(text) {
@@ -1949,6 +2011,32 @@ async function exportArtifact() {
     setExportLabel("Export failed - retry");
   } finally {
     exportArtifactButton.disabled = false;
+  }
+}
+
+async function exportSourceMarkdown() {
+  if (!exportSourceMarkdownButton) return;
+  const label = exportSourceMarkdownButton.querySelector("span");
+  exportSourceMarkdownButton.disabled = true;
+  if (label) label.textContent = "Exporting source Markdown...";
+  try {
+    const response = await fetch("/api/" + key + "/source-markdown");
+    if (!response.ok) throw new Error("source Markdown export failed");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = sourceMarkdownExportFileName();
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    if (label) label.textContent = "Export source Markdown";
+    closeMenus();
+  } catch {
+    if (label) label.textContent = "Markdown export failed - retry";
+  } finally {
+    exportSourceMarkdownButton.disabled = false;
   }
 }
 
@@ -3242,9 +3330,11 @@ chatInput.addEventListener("keydown", (event) => {
 });
 chatInput.addEventListener("input", hideSendHint);
 copyPathButton.onclick = copyFilePath;
+if (copySourceMarkdownPathButton) copySourceMarkdownPathButton.onclick = copySourceMarkdownPath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
 exportArtifactButton.onclick = exportArtifact;
+if (exportSourceMarkdownButton) exportSourceMarkdownButton.onclick = exportSourceMarkdown;
 shareArtifactButton.onclick = openShareDialog;
 shareCloseButton.onclick = closeShareDialog;
 shareCancelButton.onclick = closeShareDialog;
