@@ -54,7 +54,7 @@ import {
 } from "./export-bundle.js";
 import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from "./html-app.js";
 import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
-import { injectLavishSdk } from "./html-transform.js";
+import { injectLavishSdk, transformProxyHtml } from "./html-transform.js";
 import {
   bindHost,
   extraAllowedHosts,
@@ -68,12 +68,8 @@ import {
   sanitizeListenHosts,
 } from "./paths.js";
 import { detectTailscale } from "./tailscale.js";
-import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
-import {
-  listArtifactHistory,
-  readArtifactHistory,
-  recordArtifactSnapshot,
-} from "./artifact-history.js";
+import { canonicalFile, isHttpUrl, SessionStore, sessionKey } from "./session-store.js";
+import { listArtifactHistory, readArtifactHistory, recordArtifactSnapshot } from "./artifact-history.js";
 import { generateSharePassword } from "./share-password.js";
 import {
   ACCEPTED_IMAGE_MIME,
@@ -607,6 +603,7 @@ export async function serve({
     // reset mid-stream instead of receiving the 413.
     if (req.method === "POST" && isAttachmentUploadApiPath(req.path)) return next();
     if (isWhiteboardWriteApiPath(req.path)) return whiteboardJsonParser(req, res, next);
+    if (/^\/artifact\/[^/]+\/proxy(\/|$)/.test(req.path)) return next();
     return defaultJsonParser(req, res, next);
   });
 
@@ -674,7 +671,7 @@ export async function serve({
         return;
       }
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
-      const session = await store.upsertSession(file, sessionUrl);
+      const session = await store.upsertSession(req.body.file || file, sessionUrl);
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       }
@@ -903,7 +900,10 @@ export async function serve({
       return;
     }
     const windowsPath = String(req.body?.path || "");
-    if (!/^\\\\wsl(?:\.localhost|\$)\\[^\\/:*?\"<>|]+\\/i.test(windowsPath) || !windowsPath.split("\\").every((part) => part !== "..")) {
+    if (
+      !/^\\\\wsl(?:\.localhost|\$)\\[^\\/:*?"<>|]+\\/i.test(windowsPath) ||
+      !windowsPath.split("\\").every((part) => part !== "..")
+    ) {
       res.status(400).json({ error: "invalid Windows WSL path" });
       return;
     }
@@ -1058,6 +1058,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.status(409).json({ error: "Export is not supported for live proxy sessions" });
+        return;
+      }
       const source = await readFile(session.file, "utf8");
       const root = path.dirname(session.file);
       const { html, warnings } = await buildSelfContainedHtml(source, {
@@ -1089,6 +1093,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.status(404).json({ error: "source Markdown is unavailable for proxy sessions" });
+        return;
+      }
       const artifactHtml = await readFile(session.file, "utf8");
       const markdownSource = await readArtifactMarkdownSource(session.file, artifactHtml);
       if (!markdownSource) {
@@ -1109,6 +1117,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.json({ versions: [] });
+        return;
+      }
       const liveHtml = await readFile(session.file, "utf8").catch(() => "");
       const versions = await listArtifactHistory(session.key, { liveHtml });
       res.json({ versions });
@@ -1122,6 +1134,10 @@ export async function serve({
       const session = await store.findByKey(req.params.key);
       if (!session) {
         res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.status(409).json({ error: "History restore is not supported for live proxy sessions" });
         return;
       }
       const snap = await readArtifactHistory(session.key, req.params.version);
@@ -1152,6 +1168,10 @@ export async function serve({
       const session = await store.findByKey(req.params.key);
       if (!session) {
         res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.status(409).json({ error: "Sharing is not supported for live proxy sessions" });
         return;
       }
       const body = req.body || {};
@@ -1243,8 +1263,23 @@ export async function serve({
       }
       const session = chromeLoad.session;
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
-      const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
-      const markdownSource = await readArtifactMarkdownSource(session.file, artifactHtml);
+      let artifactHtml = "";
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        try {
+          const upstream = await fetch(session.target_url || session.file, {
+            signal: AbortSignal.timeout(5000),
+          });
+          if (upstream.ok) artifactHtml = await upstream.text();
+        } catch (e) {
+          logEvent?.(`failed to fetch target URL for head: ${e.message}`);
+        }
+      } else {
+        artifactHtml = await readFile(session.file, "utf8").catch(() => "");
+      }
+      const markdownSource =
+        session.is_proxy || isHttpUrl(session.file)
+          ? null
+          : await readArtifactMarkdownSource(session.file, artifactHtml);
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
       // Nothing legitimately frames the review chrome - it is the top-level
       // page, and shares/exports ship standalone HTML rather than embedding it.
@@ -1325,19 +1360,6 @@ export async function serve({
 
   app.get(/^\/artifact\/([^/]+)\/index\.html$/, async (req, res, next) => {
     try {
-      const isExplicitDirect =
-        req.query.direct === "1" ||
-        req.query.direct === "true" ||
-        req.query.standalone === "true" ||
-        req.get("sec-fetch-dest") === "document";
-      if (isExplicitDirect) {
-        res.setHeader(
-          "content-security-policy",
-          "sandbox allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
-        );
-      } else {
-        res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
-      }
       const key = req.params[0];
       const token = String(req.query.artifact_load_token || "");
       const revision = req.query.artifact_revision;
@@ -1345,6 +1367,31 @@ export async function serve({
       if (!beforeRead) {
         sendSessionNotFound(req, res);
         return;
+      }
+      const session = beforeRead.session;
+      const isProxy = Boolean(session.is_proxy || isHttpUrl(session.file));
+      const isExplicitDirect =
+        req.query.direct === "1" ||
+        req.query.direct === "true" ||
+        req.query.standalone === "true" ||
+        req.get("sec-fetch-dest") === "document";
+      let isLoopbackProxy = false;
+      if (isProxy) {
+        try {
+          const parsedTarget = new URL(session.target_url || session.file);
+          const h = parsedTarget.hostname.toLowerCase();
+          isLoopbackProxy = h === "localhost" || h === "127.0.0.1" || h === "::1" || h.endsWith(".localhost");
+        } catch {
+          // Ignore invalid target URL
+        }
+      }
+      if (isLoopbackProxy || isExplicitDirect) {
+        res.setHeader(
+          "content-security-policy",
+          "sandbox allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
+        );
+      } else {
+        res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
       }
       if (!beforeRead.valid && !isExplicitDirect) {
         res
@@ -1355,14 +1402,51 @@ export async function serve({
           );
         return;
       }
-      const liveHtml = await readFile(beforeRead.session.file, "utf8");
+      let liveHtml;
+      if (isProxy) {
+        const targetUrl = session.target_url || session.file;
+        try {
+          const upstreamRes = await fetch(targetUrl, { signal: AbortSignal.timeout(5000) });
+          liveHtml = await upstreamRes.text();
+        } catch {
+          liveHtml = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>App Offline · Lavish Proxy</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #1e293b; border: 1px solid #334155; padding: 2.5rem; border-radius: 0.75rem; max-width: 520px; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
+    h2 { margin: 0 0 0.75rem; color: #f43f5e; font-size: 1.5rem; font-weight: 600; }
+    p { color: #94a3b8; font-size: 0.95rem; line-height: 1.6; margin: 0 0 1rem; }
+    code { background: #0f172a; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.85rem; color: #38bdf8; word-break: break-all; }
+    .btn { margin-top: 1rem; display: inline-block; background: #2563eb; color: #fff; padding: 0.6rem 1.25rem; border-radius: 0.375rem; text-decoration: none; font-weight: 500; cursor: pointer; transition: background 0.2s; }
+    .btn:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Target Server Unreachable</h2>
+    <p>Lavish could not connect to <code>${escapeHtml(targetUrl)}</code>.</p>
+    <p>Ensure your local development server is running and listening on that address.</p>
+    <a class="btn" onclick="window.location.reload()">Retry Connection</a>
+  </div>
+</body>
+</html>`;
+        }
+      } else {
+        liveHtml = await readFile(session.file, "utf8");
+      }
       await recordArtifactSnapshot(key, liveHtml);
       const historyVersion = Number(req.query.history);
       let html = liveHtml;
       if (Number.isInteger(historyVersion) && historyVersion > 0) {
         const snap = await readArtifactHistory(key, historyVersion);
         if (!snap) {
-          res.status(404).type("html").send("<!doctype html><title>Version not found</title><p>That saved revision is gone.</p>");
+          res
+            .status(404)
+            .type("html")
+            .send("<!doctype html><title>Version not found</title><p>That saved revision is gone.</p>");
           return;
         }
         html = snap.html;
@@ -1377,18 +1461,139 @@ export async function serve({
           );
         return;
       }
-      res
-        .type("html")
-        .send(
-          injectLavishSdk(
+      const transformed = isProxy
+        ? transformProxyHtml(
+            html,
+            key,
+            session.target_url || session.file,
+            verified?.artifact_revision ?? beforeRead.artifact_revision,
+            verified?.artifact_load_token ?? beforeRead.artifact_load_token,
+            { initialAnnotate: resolveInitialAnnotateMode(req.query || {}, process.env) },
+          )
+        : injectLavishSdk(
             html,
             key,
             verified?.artifact_revision ?? beforeRead.artifact_revision,
             verified?.artifact_load_token ?? beforeRead.artifact_load_token,
             { initialAnnotate: resolveInitialAnnotateMode(req.query || {}, process.env) },
-          ),
-        );
+          );
+      res.type("html").send(transformed);
     } catch (error) {
+      next(error);
+    }
+  });
+
+  app.all(/^\/artifact\/([^/]+)\/proxy(\/.*)?$/, async (req, res, next) => {
+    try {
+      const key = req.params[0];
+      const session = await store.findByKey(key);
+      if (!session || (!session.is_proxy && !isHttpUrl(session.file))) {
+        sendSessionNotFound(req, res);
+        return;
+      }
+      const targetBase = new URL(session.target_url || session.file);
+      const subpath = req.params[1] || "/";
+      const targetUrl = new URL(subpath.slice(1), targetBase.origin + "/");
+      if (targetUrl.origin !== targetBase.origin) {
+        res.status(400).json({ error: "Bad Request", message: "Cross-origin proxy requests are forbidden" });
+        return;
+      }
+      const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+      const upstreamHref = targetUrl.origin + targetUrl.pathname + search;
+
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers.connection;
+      headers["x-forwarded-for"] = req.ip || "127.0.0.1";
+      headers["x-forwarded-proto"] = req.protocol;
+      headers["x-forwarded-host"] = req.get("host") || "127.0.0.1";
+
+      /** @type {RequestInit & { duplex?: string }} */
+      const init = {
+        method: req.method,
+        headers,
+        redirect: "manual",
+      };
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        init.body = req;
+        init.duplex = "half";
+      }
+
+      /** @type {Response} */
+      let upstreamRes;
+      try {
+        upstreamRes = await fetch(upstreamHref, init);
+      } catch (proxyError) {
+        res.status(502).json({
+          error: "Bad Gateway",
+          message: `Could not connect to target server at ${upstreamHref}`,
+          cause: proxyError.message,
+        });
+        return;
+      }
+
+      if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+        const location = upstreamRes.headers.get("location");
+        if (location) {
+          try {
+            const locUrl = new URL(location, upstreamHref);
+            if (locUrl.origin === targetBase.origin) {
+              res.setHeader("location", `/artifact/${key}/proxy${locUrl.pathname}${locUrl.search}`);
+            } else {
+              res.setHeader("location", location);
+            }
+          } catch {
+            res.setHeader("location", location);
+          }
+        }
+        res.status(upstreamRes.status).end();
+        return;
+      }
+
+      res.status(upstreamRes.status);
+      for (const [headerName, headerVal] of upstreamRes.headers.entries()) {
+        const lower = headerName.toLowerCase();
+        if (
+          lower === "content-security-policy" ||
+          lower === "x-frame-options" ||
+          lower === "content-encoding" ||
+          lower === "content-length" ||
+          lower === "transfer-encoding" ||
+          lower === "connection" ||
+          lower === "set-cookie"
+        ) {
+          continue;
+        }
+        res.setHeader(headerName, headerVal);
+      }
+      if (typeof upstreamRes.headers.getSetCookie === "function") {
+        const cookies = upstreamRes.headers.getSetCookie();
+        if (cookies?.length) {
+          res.setHeader("set-cookie", cookies);
+        }
+      }
+
+      const contentType = upstreamRes.headers.get("content-type") || "";
+      if (contentType.includes("text/html")) {
+        const htmlText = await upstreamRes.text();
+        const activeLoad = store.artifactLoads.get(key);
+        const loadToken = activeLoad?.artifactLoadToken || "";
+        const revision = activeLoad?.artifactRevision ?? session.artifact_revision;
+
+        const transformedHtml = transformProxyHtml(
+          htmlText,
+          key,
+          session.target_url || session.file,
+          revision,
+          loadToken,
+        );
+        res.type("html").send(transformedHtml);
+      } else {
+        const buffer = Buffer.from(await upstreamRes.arrayBuffer());
+        res.send(buffer);
+      }
+    } catch (error) {
+      logEvent?.(`proxy error: ${error.message}`);
       next(error);
     }
   });
@@ -1401,6 +1606,10 @@ export async function serve({
       const session = await store.findByKey(key);
       if (!session) {
         sendSessionNotFound(req, res);
+        return;
+      }
+      if (session.is_proxy || isHttpUrl(session.file)) {
+        res.redirect(`/artifact/${key}/proxy/${assetPath}`);
         return;
       }
       const root = path.dirname(session.file);
@@ -2315,6 +2524,9 @@ export async function resolveArtifactAsset(root, assetPath) {
  * @param {(key: string) => number} reloadDebounceMs
  */
 async function watchSession(session, watchers, events, logEvent, reloadDebounceMs = () => RELOAD_DEBOUNCE_MS) {
+  if (session.is_proxy || isHttpUrl(session.file)) {
+    return;
+  }
   if (watchers.has(session.key)) {
     return;
   }
@@ -2733,6 +2945,23 @@ export function createChromeHtml(
   const layoutGateHidden = layoutGateEnabled ? "" : " hidden";
   const modeHotkeyUpper = MODE_TOGGLE_HOTKEY_KEY.toUpperCase();
   const modeToggleHint = `Toggle annotate/explore mode (⌘${modeHotkeyUpper} / Ctrl+${modeHotkeyUpper})`;
+  const isProxy = Boolean(session.is_proxy || (typeof session.file === "string" && /^https?:\/\//i.test(session.file)));
+  let isLoopbackProxy = false;
+  if (isProxy) {
+    try {
+      const parsedTarget = new URL(session.target_url || session.file);
+      const host = parsedTarget.hostname.toLowerCase();
+      isLoopbackProxy = host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
+    } catch {
+      // Ignore invalid target URL
+    }
+  }
+  // Trust model: allow-same-origin is granted only to local loopback proxy targets
+  // (user's local development server) where full DOM access and local state are expected.
+  // External URLs are strictly isolated without allow-same-origin to protect Lavish origin data.
+  const sandboxAttrs = isLoopbackProxy
+    ? "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"
+    : "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
   return `<!doctype html>
 <html>
 <head>
@@ -2745,7 +2974,7 @@ ${faviconTag}
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="${initialAnnotate ? "true" : "false"}" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div>${sourceMarkdownMenu}<div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><div class="menu-rule"></div><div class="menu-head"><div class="menu-label">Versions</div></div><div class="version-list" id="versionList"></div><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="history-banner" id="historyBanner" hidden><span id="historyBannerText">Viewing a saved revision.</span><button class="handoff-takeover" id="historyRestore" type="button">Restore this version</button><button class="handoff-takeover" id="historyLive" type="button">Back to live file</button></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html${initialAnnotate ? "" : "?annotate=off"}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="${sandboxAttrs}" data-artifact-src="/artifact/${session.key}/index.html${initialAnnotate ? "" : "?annotate=off"}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
