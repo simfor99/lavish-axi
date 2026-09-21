@@ -267,12 +267,19 @@ export async function openCommand(args) {
   }
   const isUrl = isHttpUrl(file);
   if (isUrl) {
-    if (file.includes("/session/") || file.includes("/artifact/")) {
-      throw new AxiError(
-        "Cannot wrap an existing Lavish review session inside another Lavish session",
-        "VALIDATION_ERROR",
-        ["Pass the original target web application URL instead, e.g. http://127.0.0.1:8000/setup"],
-      );
+    try {
+      const parsed = new URL(file);
+      const h = parsed.hostname.toLowerCase();
+      const isLoopback = h === "localhost" || h === "127.0.0.1" || h === "::1" || h.endsWith(".localhost");
+      if (isLoopback && (parsed.pathname.startsWith("/session/") || parsed.pathname.startsWith("/artifact/"))) {
+        throw new AxiError(
+          "Cannot wrap an existing Lavish review session inside another Lavish session",
+          "VALIDATION_ERROR",
+          ["Pass the original target web application URL instead, e.g. http://127.0.0.1:8000/setup"],
+        );
+      }
+    } catch (e) {
+      if (e instanceof AxiError) throw e;
     }
   } else {
     await assertHtmlFile(file);

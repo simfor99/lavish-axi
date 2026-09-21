@@ -1504,6 +1504,16 @@ export async function serve({
       const headers = { ...req.headers };
       delete headers.host;
       delete headers.connection;
+      const targetHost = targetBase.hostname.toLowerCase();
+      const isLoopbackTarget =
+        targetHost === "localhost" ||
+        targetHost === "127.0.0.1" ||
+        targetHost === "::1" ||
+        targetHost.endsWith(".localhost");
+      if (!isLoopbackTarget) {
+        delete headers.cookie;
+        delete headers.authorization;
+      }
       headers["x-forwarded-for"] = req.ip || "127.0.0.1";
       headers["x-forwarded-proto"] = req.protocol;
       headers["x-forwarded-host"] = req.get("host") || "127.0.0.1";
@@ -1521,8 +1531,10 @@ export async function serve({
 
       /** @type {Response} */
       let upstreamRes;
+      const connectController = new AbortController();
+      const connectTimeout = setTimeout(() => connectController.abort(), 15000);
       try {
-        upstreamRes = await fetch(upstreamHref, init);
+        upstreamRes = await fetch(upstreamHref, { ...init, signal: connectController.signal });
       } catch (proxyError) {
         res.status(502).json({
           error: "Bad Gateway",
@@ -1530,6 +1542,8 @@ export async function serve({
           cause: proxyError.message,
         });
         return;
+      } finally {
+        clearTimeout(connectTimeout);
       }
 
       if (upstreamRes.status >= 300 && upstreamRes.status < 400) {

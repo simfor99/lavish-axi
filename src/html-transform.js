@@ -59,11 +59,19 @@ export function transformProxyHtml(html, key, targetUrl, artifactRevision, artif
         if (input.startsWith("/") && !input.startsWith("//") && !input.startsWith("/artifact/") && !input.startsWith("/sdk.js")) {
           input = prefix + input;
         }
+      } else if (input instanceof URL) {
+        if (input.origin === window.location.origin && !input.pathname.startsWith("/artifact/") && !input.pathname.startsWith("/sdk.js")) {
+          input = new URL(prefix + input.pathname + input.search, window.location.href);
+        }
       } else if (input && typeof input === "object" && input.url) {
         try {
           var u = new URL(input.url, window.location.href);
           if (u.origin === window.location.origin && !u.pathname.startsWith("/artifact/") && !u.pathname.startsWith("/sdk.js")) {
-            input = new Request(prefix + u.pathname + u.search, input);
+            var reqInit = Object.assign({}, input);
+            if (input.body && !["GET", "HEAD"].includes(input.method)) {
+              reqInit.duplex = "half";
+            }
+            input = new Request(prefix + u.pathname + u.search, reqInit);
           }
         } catch(e) {}
       }
