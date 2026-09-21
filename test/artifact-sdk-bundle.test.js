@@ -39,12 +39,19 @@ function createElement(tag) {
     getAttribute(name) {
       return attributes.has(name) ? attributes.get(name) : null;
     },
+    className: "",
     matches(selectorList) {
       return String(selectorList)
         .split(",")
         .some((part) => {
           const selector = part.trim();
+          if (!selector) return false;
           if (selector.startsWith("[")) return attributes.has(selector.slice(1, selector.indexOf("]")).split("=")[0]);
+          if (selector.startsWith(".")) {
+            return String(element.className || "")
+              .split(/\s+/)
+              .includes(selector.slice(1));
+          }
           return selector === element.tagName.toLowerCase();
         });
     },
@@ -196,9 +203,10 @@ function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
     body,
     api: sandbox.window.lavish,
     click(target) {
-      const listener = documentListeners.find((entry) => entry.type === "click");
-      assert.ok(listener, "the SDK registers a document click listener");
-      listener.handler({ target, preventDefault() {}, stopPropagation() {} });
+      const listeners = documentListeners.filter((entry) => entry.type === "click");
+      assert.ok(listeners.length, "the SDK registers a document click listener");
+      const event = { target, preventDefault() {}, stopPropagation() {} };
+      for (const listener of listeners) listener.handler(event);
     },
     rightClick(target) {
       const listener = documentListeners.find((entry) => entry.type === "contextmenu");
@@ -247,6 +255,16 @@ function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
       const listeners = windowListeners.filter((entry) => entry.type === "message");
       assert.ok(listeners.length > 0, "the SDK registers a window message listener");
       for (const listener of listeners) listener.handler({ source: sandbox.parent, data });
+    },
+    scroll() {
+      const listeners = windowListeners.filter((entry) => entry.type === "scroll");
+      assert.ok(listeners.length > 0, "the SDK registers a window scroll listener");
+      for (const listener of listeners) listener.handler();
+    },
+    copyButton() {
+      return documentElement.children
+        .flatMap((child) => child.shadowRoot?.children || [])
+        .find((child) => child.className === "lavish-copy-markdown");
     },
     cards() {
       return documentElement.children
@@ -343,14 +361,32 @@ test("explore mode keeps left clicks native while the SDK annotates on right cli
   assert.equal(message.prompt.prompt, "Check this permission");
 });
 
+test("a marked link remains navigable on left click and annotatable on right click", () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const link = appendTo(sdk.body, cell("a", "Historische Modellantwort"));
+  link.setAttribute("data-lavish-action", "link");
+  link.setAttribute("href", "\\\\wsl.localhost\\Ubuntu\\home\\simon\\example.json");
+
+  sdk.click(link);
+  assert.equal(sdk.cards().length, 0);
+
+  sdk.rightClick(link);
+  const message = sdk.queue("Dieser Link soll anders heißen.");
+  assert.equal(message.type, "lavish:queuePrompt");
+  assert.equal(message.prompt.tag, "a");
+  assert.equal(message.prompt.text, "Historische Modellantwort");
+});
+
 test("hovering a report card offers a Markdown copy control without opening an annotation", async () => {
   const sdk = bootSdk({ initialAnnotate: false });
   const reportCard = appendTo(sdk.body, cell("article", "Nur mit Freigabe"));
 
   sdk.trigger("mouseover", { target: reportCard });
-  const root = sdk.body.parentElement.children.find((child) => child.className === "lavish-annotation-root").shadowRoot;
-  const copyButton = root.children.find((child) => child.className === "lavish-copy-markdown");
+  const copyButton = sdk.copyButton();
   assert.ok(copyButton, "a compact copy control is placed over the hovered card");
+  assert.equal(copyButton.hidden, false);
+  assert.equal(copyButton.style.top, "18px");
+  assert.equal(copyButton.style.left, "78px");
 
   const click = copyButton.listeners.find((entry) => entry.type === "click");
   assert.ok(click, "the control handles its own click");
@@ -358,6 +394,45 @@ test("hovering a report card offers a Markdown copy control without opening an a
 
   assert.deepEqual(sdk.clipboardWrites, ["Nur mit Freigabe"]);
   assert.equal(sdk.cards().length, 0, "copying is a native card action, never an annotation");
+});
+
+test("the copy control attaches to the nearest hovered block, not a coarser ancestor", async () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const sourceCard = appendTo(sdk.body, cell("div", ""));
+  sourceCard.className = "src-card";
+  const meta = appendTo(sourceCard, cell("div", "Strategic content execution architecture"));
+  meta.className = "meta-block meta-topic";
+  meta.getBoundingClientRect = () => ({ left: 40, top: 120, right: 400, bottom: 180, width: 360, height: 60 });
+  sourceCard.getBoundingClientRect = () => ({ left: 20, top: -80, right: 500, bottom: 900, width: 480, height: 980 });
+
+  sdk.trigger("mouseover", { target: meta });
+  const copyButton = sdk.copyButton();
+  assert.ok(copyButton, "the copy control appears for the hovered meta block");
+  assert.equal(copyButton.style.top, "128px", "the control sits on the meta block, not the scrolled card");
+  assert.equal(copyButton.style.left, "368px");
+
+  const click = copyButton.listeners.find((entry) => entry.type === "click");
+  await click.handler({ preventDefault() {}, stopPropagation() {} });
+  assert.deepEqual(sdk.clipboardWrites, ["Strategic content execution architecture"]);
+});
+
+test("scrolling a hovered block off-screen hides the copy control instead of pinning it to the viewport", () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const notice = appendTo(sdk.body, cell("aside", "Diese Fläche projiziert die Wissensinsel"));
+  notice.className = "notice";
+  notice.getBoundingClientRect = () => ({ left: 400, top: 40, right: 1012, bottom: 120, width: 612, height: 80 });
+
+  sdk.trigger("mouseover", { target: notice });
+  const copyButton = sdk.copyButton();
+  assert.ok(copyButton);
+  assert.equal(copyButton.hidden, false);
+  assert.equal(copyButton.style.top, "48px");
+  assert.equal(copyButton.style.left, "980px");
+
+  notice.getBoundingClientRect = () => ({ left: 400, top: -220, right: 1012, bottom: -140, width: 612, height: 80 });
+  sdk.scroll();
+  assert.equal(copyButton.hidden, true, "the control must not stick to the viewport corner");
+  assert.equal(sdk.copyButton() && sdk.copyButton().hidden, true);
 });
 
 test("scroll position marks the current sidebar section, including the final sources section", () => {

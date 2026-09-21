@@ -1146,6 +1146,11 @@ export function createArtifactSdk(
   function isLavishAction(el) {
     return !!(el && el.closest && el.closest("[data-lavish-action]"));
   }
+  function windowsWslLink(el) {
+    const link = el?.closest?.("a[data-lavish-wsl-path],a[href]");
+    const windowsPath = link?.getAttribute?.("data-lavish-wsl-path") || link?.getAttribute?.("href") || "";
+    return /^\\\\wsl(?:\.localhost|\$)\\[^\\/]+\\/i.test(windowsPath) ? windowsPath : "";
+  }
 
   // Native interactive controls (radios, checkboxes, inputs, selects, buttons,
   // labels, disclosure summaries, editable regions) should toggle/focus/type
@@ -1155,13 +1160,26 @@ export function createArtifactSdk(
     return isNativeInteractive(el);
   }
 
+  const COPY_TARGET_SELECTOR =
+    "[data-lavish-copy],article,p,li,h1,h2,h3,h4,h5,h6,blockquote,pre,figcaption,td,th,.card,.metric,.notice,.source,.callout,.panel,.review-card,.report-card,.evidence-card,.src-card,.sec-card,.meta-block,.dp-card,.tr-card,.source-banner,.sub,.island";
+
   function copyTargetFor(el) {
     if (!(el instanceof Element) || isLavishUi(el)) return null;
-    const target = el.closest(
-      "[data-lavish-copy],article,.card,.metric,.notice,.source,.callout,.panel,.review-card,.report-card,.evidence-card",
-    );
-    if (!target || isLavishUi(target) || target.getBoundingClientRect().width <= 0) return null;
-    return target;
+    const matches = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (!node.matches?.(COPY_TARGET_SELECTOR) || isLavishUi(node)) continue;
+      const tag = String(node.tagName || "").toLowerCase();
+      if (tag === "html" || tag === "body" || tag === "main" || tag === "nav") continue;
+      const className = String(node.className || "");
+      if (/\b(layout|content|rail|topline|toc)\b/.test(className)) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      matches.push({ node, height: rect.height });
+    }
+    if (!matches.length) return null;
+    const limit = Math.max(140, (window.innerHeight || 0) * 0.45);
+    const small = matches.filter((entry) => entry.height <= limit);
+    return small[0] ? small[0].node : null;
   }
 
   function markdownFromElement(element) {
@@ -1221,8 +1239,24 @@ export function createArtifactSdk(
   function positionCopyButton() {
     if (!copyTarget || !copyButton) return;
     const rect = copyTarget.getBoundingClientRect();
-    copyButton.style.left = Math.max(6, rect.right - 32) + "px";
-    copyButton.style.top = Math.max(6, rect.top + 8) + "px";
+    const viewportWidth = window.innerWidth || 0;
+    const viewportHeight = window.innerHeight || 0;
+    const left = rect.right - 32;
+    const top = rect.top + 8;
+    const onScreen =
+      top >= 0 &&
+      left >= 0 &&
+      top <= viewportHeight - 24 &&
+      left <= viewportWidth - 24 &&
+      rect.bottom > 0 &&
+      rect.right > 0;
+    if (!onScreen) {
+      hideCopyButton();
+      return;
+    }
+    copyButton.hidden = false;
+    copyButton.style.left = left + "px";
+    copyButton.style.top = top + "px";
   }
 
   function hideCopyButton() {
@@ -2699,7 +2733,13 @@ export function createArtifactSdk(
     "mouseover",
     (event) => {
       const target = copyTargetFor(event.target);
-      if (target) showCopyButton(target);
+      if (target) {
+        showCopyButton(target);
+        return;
+      }
+      if (copyTarget && copyButton && !copyButton.contains?.(event.target) && !isLavishUi(event.target)) {
+        if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 80);
+      }
     },
     true,
   );
@@ -2771,6 +2811,18 @@ export function createArtifactSdk(
   document.addEventListener(
     "click",
     (event) => {
+      const windowsPath = windowsWslLink(event.target);
+      if (!windowsPath || event.ctrlKey || event.metaKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      postArtifactMessage("lavish:openWindowsWslPath", { path: windowsPath });
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "click",
+    (event) => {
       if (
         !annotationMode ||
         event.ctrlKey ||
@@ -2798,7 +2850,6 @@ export function createArtifactSdk(
       if (
         !target ||
         isLavishUi(target) ||
-        isLavishAction(target) ||
         target.closest("input,textarea,[contenteditable]:not([contenteditable='false'])")
       ) {
         return;

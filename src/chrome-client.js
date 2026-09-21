@@ -127,6 +127,12 @@ const moreWrap = /** @type {HTMLDivElement} */ (document.getElementById("moreWra
 const moreButton = /** @type {HTMLButtonElement} */ (document.getElementById("moreButton"));
 const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMenu"));
 const reloadArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("reloadArtifact"));
+const versionList = /** @type {HTMLDivElement | null} */ (document.getElementById("versionList"));
+const historyBanner = /** @type {HTMLDivElement | null} */ (document.getElementById("historyBanner"));
+const historyBannerText = /** @type {HTMLSpanElement | null} */ (document.getElementById("historyBannerText"));
+const historyRestoreButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("historyRestore"));
+const historyLiveButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("historyLive"));
+let viewingHistoryVersion = 0;
 const copySnapshotButton = /** @type {HTMLButtonElement} */ (document.getElementById("copySnapshot"));
 const exportArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("exportArtifact"));
 const exportSourceMarkdownButton = /** @type {HTMLButtonElement | null} */ (
@@ -326,14 +332,66 @@ let sendAcknowledgementWarningVisible = false;
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
-  return (
+  let src =
     artifactSrc +
     separator +
     "artifact_revision=" +
     encodeURIComponent(load.revision) +
     "&artifact_load_token=" +
-    encodeURIComponent(load.token)
-  );
+    encodeURIComponent(load.token);
+  if (viewingHistoryVersion > 0) {
+    src += "&history=" + encodeURIComponent(String(viewingHistoryVersion));
+  }
+  return src;
+}
+
+function formatHistoryTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function setHistoryBanner() {
+  if (!historyBanner || !historyBannerText) return;
+  if (viewingHistoryVersion > 0) {
+    historyBanner.hidden = false;
+    historyBannerText.textContent = `Viewing saved revision ${viewingHistoryVersion}. This is not the live file.`;
+  } else {
+    historyBanner.hidden = true;
+  }
+}
+
+async function refreshVersionList() {
+  if (!versionList) return;
+  try {
+    const res = await fetch(`/api/${encodeURIComponent(key)}/history`, { cache: "no-store" });
+    if (!res.ok) throw new Error("history");
+    const data = await res.json();
+    const versions = Array.isArray(data?.versions) ? data.versions : [];
+    if (!versions.length) {
+      versionList.innerHTML = `<div class="version-empty">No saved revisions yet. Reload the artifact after a change.</div>`;
+      return;
+    }
+    versionList.replaceChildren();
+    for (const entry of [...versions].reverse()) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "version-item";
+      if (entry.current) button.classList.add("is-current");
+      if (entry.version === viewingHistoryVersion) button.classList.add("is-viewing");
+      const live = entry.current ? " · live" : "";
+      button.textContent = `v${entry.version} · ${formatHistoryTime(entry.created_at)}${live}`;
+      button.onclick = () => {
+        viewingHistoryVersion = entry.current ? 0 : entry.version;
+        setHistoryBanner();
+        closeMenus();
+        reloadArtifact();
+      };
+      versionList.append(button);
+    }
+  } catch {
+    versionList.innerHTML = `<div class="version-empty">Could not load versions.</div>`;
+  }
 }
 
 function escapeHtml(value) {
@@ -3726,6 +3784,14 @@ window.addEventListener("message", (event) => {
     return;
   }
   // The artifact spoke, so it rendered and ran its SDK - there is nothing fatal to probe for.
+  if (msg.type === "lavish:openWindowsWslPath") {
+    fetch("/api/" + key + "/open-windows-wsl-path", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: String(msg.path || "") }),
+    }).catch(() => {});
+    return;
+  }
   if (msg.type === "lavish:queuePrompt") {
     enqueuePrompt(msg.prompt);
     // Queued from inside the artifact, where the closed dock is the only sign it landed.
@@ -3899,6 +3965,7 @@ sendAndEndButton.onclick = () => sendQueued(true);
 moreButton.onclick = () => {
   closeWarningsDrawer();
   toggleMenu(moreButton, moreMenu);
+  if (moreMenu && !moreMenu.hidden) refreshVersionList();
 };
 warningsButton.onclick = toggleWarningsDrawer;
 warningsSelectAll.onchange = toggleSelectAllWarnings;
@@ -3996,6 +4063,34 @@ copyPathButton.onclick = copyFilePath;
 if (copySourceMarkdownPathButton) copySourceMarkdownPathButton.onclick = copySourceMarkdownPath;
 if (exportSourceMarkdownButton) exportSourceMarkdownButton.onclick = exportSourceMarkdown;
 reloadArtifactButton.onclick = reloadArtifact;
+if (historyLiveButton) {
+  historyLiveButton.onclick = () => {
+    viewingHistoryVersion = 0;
+    setHistoryBanner();
+    reloadArtifact();
+  };
+}
+if (historyRestoreButton) {
+  historyRestoreButton.onclick = async () => {
+    if (viewingHistoryVersion < 1) return;
+    const version = viewingHistoryVersion;
+    historyRestoreButton.disabled = true;
+    try {
+      const res = await fetch(
+        `/api/${encodeURIComponent(key)}/history/${encodeURIComponent(String(version))}/restore`,
+        { method: "POST" },
+      );
+      if (!res.ok) throw new Error("restore");
+      viewingHistoryVersion = 0;
+      setHistoryBanner();
+      reloadArtifact();
+    } catch {
+      historyBannerText && (historyBannerText.textContent = `Could not restore revision ${version}.`);
+    } finally {
+      historyRestoreButton.disabled = false;
+    }
+  };
+}
 copySnapshotButton.onclick = copyDomSnapshot;
 exportArtifactButton.onclick = exportArtifact;
 shareArtifactButton.onclick = openShareDialog;

@@ -6639,3 +6639,50 @@ test("the live transcript carries rendered html for agent replies and never for 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("createChromeHtml includes a versions list and history banner", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  assert.match(html, /id="versionList"/);
+  assert.match(html, /id="historyBanner"/);
+  assert.match(html, /id="historyRestore"/);
+});
+
+test("artifact load snapshots HTML and restore writes the live file", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-history-serve-"));
+  const previousStateDir = process.env.LAVISH_AXI_STATE_DIR;
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const artifact = path.join(dir, "page.html");
+  await writeFile(artifact, "<p>first</p>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    const key = opened.key;
+    const load = await beginArtifactLoad(base, key);
+    const live = await fetch(artifactLoadUrl(base, key, load));
+    assert.equal(live.status, 200);
+    assert.match(await live.text(), /<p>first<\/p>/);
+    await writeFile(artifact, "<p>second</p>");
+    const load2 = await beginArtifactLoad(base, key);
+    const second = await fetch(artifactLoadUrl(base, key, load2));
+    assert.equal(second.status, 200);
+    const listed = await fetch(`${base}/api/${key}/history`).then((response) => response.json());
+    assert.ok(listed.versions.length >= 2);
+    const firstVersion = listed.versions[0].version;
+    const preview = await fetch(`${artifactLoadUrl(base, key, load2)}&history=${firstVersion}`);
+    assert.equal(preview.status, 200);
+    assert.match(await preview.text(), /<p>first<\/p>/);
+    const restored = await fetch(`${base}/api/${key}/history/${firstVersion}/restore`, { method: "POST" });
+    assert.equal(restored.status, 200);
+    assert.equal(await readFile(artifact, "utf8"), "<p>first</p>");
+  } finally {
+    await server.close();
+    if (previousStateDir === undefined) delete process.env.LAVISH_AXI_STATE_DIR;
+    else process.env.LAVISH_AXI_STATE_DIR = previousStateDir;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
