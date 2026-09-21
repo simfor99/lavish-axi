@@ -52,6 +52,10 @@ async function writeIndex(sessionKey, index, env) {
   await writeFile(indexPath(sessionKey, env), `${JSON.stringify(index, null, 2)}\n`, "utf8");
 }
 
+/**
+ * @param {string} sessionKey
+ * @param {{ liveHtml?: string, env?: NodeJS.ProcessEnv }} [options]
+ */
 export async function listArtifactHistory(sessionKey, { liveHtml, env = process.env } = {}) {
   const index = await readIndex(sessionKey, env);
   const liveHash = liveHtml == null ? null : sha256(liveHtml);

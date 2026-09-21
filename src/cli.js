@@ -36,7 +36,7 @@ import {
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import { analyzeSelfPaint, SELF_PAINT_WARNING } from "./self-paint.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
-import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
+import { canonicalFile, isHttpUrl, sessionKey, SessionStore } from "./session-store.js";
 import { generateSharePassword } from "./share-password.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
@@ -260,14 +260,32 @@ export function createUserEndedOpenOutput({ file, url, networkWarning = undefine
   };
 }
 
-async function openCommand(args) {
+export async function openCommand(args) {
   const file = firstPositionalArg(args);
   if (!file) {
-    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi <html-file>`"]);
+    throw new AxiError("HTML file path or URL is required", "VALIDATION_ERROR", ["Run `lavish-axi <html-file|url>`"]);
   }
-  await assertHtmlFile(file);
+  const isUrl = isHttpUrl(file);
+  if (isUrl) {
+    try {
+      const parsed = new URL(file);
+      const h = parsed.hostname.toLowerCase();
+      const isLoopback = h === "localhost" || h === "127.0.0.1" || h === "::1" || h.endsWith(".localhost");
+      if (isLoopback && (parsed.pathname.startsWith("/session/") || parsed.pathname.startsWith("/artifact/"))) {
+        throw new AxiError(
+          "Cannot wrap an existing Lavish review session inside another Lavish session",
+          "VALIDATION_ERROR",
+          ["Pass the original target web application URL instead, e.g. http://127.0.0.1:8000/setup"],
+        );
+      }
+    } catch (e) {
+      if (e instanceof AxiError) throw e;
+    }
+  } else {
+    await assertHtmlFile(file);
+  }
   const absolute = await canonicalFile(file);
-  const selfPaintWarning = await selfPaintWarningForFile(absolute);
+  const selfPaintWarning = isUrl ? undefined : await selfPaintWarningForFile(absolute);
   const noGate = args.includes("--no-gate");
   const reopen = args.includes("--reopen");
   const baseUrl = await ensureServer({

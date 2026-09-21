@@ -85,19 +85,22 @@ export class SessionStore {
     // taking the lock and keep only the read-modify-write inside the critical
     // section.
     const absolute = await canonicalFile(file);
-    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url));
+    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url, isHttpUrl(file) ? file : undefined));
   }
 
-  async #upsertSessionLocked(absolute, url) {
+  async #upsertSessionLocked(absolute, url, originalTargetUrl) {
     const key = sessionKey(absolute);
     const state = await this.readState();
     const existing = state.sessions[key] || {};
     const existingPrompts = existing.prompts || [];
     const existingStatus = existing.status === "ended" ? "open" : existing.status || "open";
+    const isProxy = isHttpUrl(absolute);
     const session = {
       key,
       file: absolute,
       url,
+      is_proxy: isProxy || Boolean(existing.is_proxy),
+      target_url: isProxy ? existing.target_url || originalTargetUrl || absolute : undefined,
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
       pending_prompts: existing.pending_prompts || 0,
       prompts: existingPrompts,
@@ -715,7 +718,56 @@ export class SessionStore {
   }
 }
 
+export function isHttpUrl(value) {
+  return typeof value === "string" && /^https?:\/\//i.test(value);
+}
+
+export function canonicalizeUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.protocol = parsed.protocol.toLowerCase();
+    parsed.hostname = parsed.hostname.toLowerCase();
+
+    // 1. Canonicalize localhost aliases
+    if (parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]") {
+      parsed.hostname = "localhost";
+    }
+
+    // 2. Strip default ports
+    if (
+      (parsed.protocol === "http:" && parsed.port === "80") ||
+      (parsed.protocol === "https:" && parsed.port === "443")
+    ) {
+      parsed.port = "";
+    }
+
+    // 3. Strip client-side fragments (#...)
+    parsed.hash = "";
+
+    // 4. Alphabetize query parameters
+    const params = Array.from(parsed.searchParams.entries()).sort(
+      (a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]),
+    );
+    parsed.search = "";
+    for (const [k, v] of params) {
+      parsed.searchParams.append(k, v);
+    }
+
+    // 5. Normalize trailing slashes on sub-paths
+    if (parsed.pathname.length > 1 && parsed.pathname.endsWith("/")) {
+      parsed.pathname = parsed.pathname.slice(0, -1);
+    }
+
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 export async function canonicalFile(file) {
+  if (isHttpUrl(file)) {
+    return canonicalizeUrl(file);
+  }
   const absolute = path.resolve(file);
   return realpath(absolute);
 }
