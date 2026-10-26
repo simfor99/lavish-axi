@@ -421,7 +421,24 @@ test("/health omits wildcard CORS and wrapped-favicon enforces same-origin and 2
         res.end(Buffer.alloc(300 * 1024, 0x41));
         return;
       }
-      const href = iconMode === "foreign" ? `http://127.0.0.1:${foreignPort}/leak.png` : "/oversized.png";
+      if (req.url === "/html-fallback.ico") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end("<!doctype html><html><body>Not an image</body></html>");
+        return;
+      }
+      if (req.url === "/small.png") {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+        return;
+      }
+      const href =
+        iconMode === "foreign"
+          ? `http://127.0.0.1:${foreignPort}/leak.png`
+          : iconMode === "oversized"
+            ? "/oversized.png"
+            : iconMode === "html"
+              ? "/html-fallback.ico"
+              : "/small.png";
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(`<!doctype html><html><head><link rel="icon" href="${href}"></head><body><h1>App</h1></body></html>`);
     });
@@ -456,6 +473,18 @@ test("/health omits wildcard CORS and wrapped-favicon enforces same-origin and 2
     const fav2 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
     const svg2 = await fav2.text();
     assert.doesNotMatch(svg2, /data:image\//, "oversized favicon (>256 KiB) must be dropped");
+
+    iconMode = "html";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav3 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg3 = await fav3.text();
+    assert.doesNotMatch(svg3, /data:/, "non-image MIME response must not be embedded");
+
+    iconMode = "small";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav4 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg4 = await fav4.text();
+    assert.match(svg4, /data:image\/png;base64,/, "small same-origin image favicon must be embedded");
   } finally {
     if (lavish) await lavish.close();
     if (upstreamServer) await new Promise((resolve) => upstreamServer.close(resolve));

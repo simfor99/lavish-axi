@@ -1689,13 +1689,20 @@ export async function serve({
                 signal: AbortSignal.timeout(3000),
               });
               if (iconRes.ok) {
-                const mime =
+                const mime = (
                   iconRes.headers.get("content-type")?.split(";")[0]?.trim() ||
-                  (resolvedIconUrl.pathname.endsWith(".svg") ? "image/svg+xml" : "image/png");
-                const buf = await readResponseBytesBounded(iconRes, MAX_FAVICON_BYTES);
-                if (buf) {
-                  iconDataUri = `data:${mime};base64,${buf.toString("base64")}`;
+                  (resolvedIconUrl.pathname.endsWith(".svg") ? "image/svg+xml" : "image/png")
+                ).toLowerCase();
+                if (mime.startsWith("image/")) {
+                  const buf = await readResponseBytesBounded(iconRes, MAX_FAVICON_BYTES);
+                  if (buf) {
+                    iconDataUri = `data:${mime};base64,${buf.toString("base64")}`;
+                  }
+                } else {
+                  await iconRes.body?.cancel?.().catch(() => {});
                 }
+              } else {
+                await iconRes.body?.cancel?.().catch(() => {});
               }
             }
           }
