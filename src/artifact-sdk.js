@@ -1,5 +1,6 @@
 /* global CSS, Element, MutationObserver, ResizeObserver, document, getComputedStyle, parent, window */
 
+import { readArtifactRevisions } from "./artifact-revisions.js";
 import * as mermaidHelpers from "./mermaid-node.js";
 import { tableCellTarget } from "./table-cell.js";
 
@@ -114,13 +115,21 @@ export function deriveLavishQueueKey(element, options = {}) {
 }
 
 export function isNativeInteractiveControl(el) {
-  return !!(
-    el &&
-    el.closest &&
+  if (!el || !el.closest) return false;
+  if (
     el.closest(
       "button,input,select,textarea,option,optgroup,label,summary,[contenteditable]:not([contenteditable='false'])",
     )
+  ) {
+    return true;
+  }
+  const widget = el.closest(
+    "[role='button'],[role='checkbox'],[role='combobox'],[role='menuitem'],[role='menuitemcheckbox']," +
+      "[role='menuitemradio'],[role='option'],[role='radio'],[role='switch'],[role='tab'],[role='treeitem']",
   );
+  if (!widget) return false;
+  const link = el.closest("a[href]");
+  return !(link && widget.contains(link));
 }
 
 // A severe text failure needs rendered-fragment proof. Scroll dimensions include harmless font
@@ -467,6 +476,9 @@ export function createArtifactSdk(
   let hovered = null;
   let selected = null;
   let ignoreNextClick = false;
+  // Selectors the chrome reports as carrying a queued note. A click on one opens that note in the
+  // chrome's panel instead of a fresh card; the note's words never enter this document.
+  let queuedAnchorSelectors = new Set();
   let shadow = null;
   let copyTarget = null;
   let copyButton = null;
@@ -651,6 +663,12 @@ export function createArtifactSdk(
             url: "",
           });
         } else if (decision.kind === "accept") {
+          let initialUrl;
+          try {
+            initialUrl = URL.createObjectURL(decision.file);
+          } catch {
+            initialUrl = "";
+          }
           const item = {
             localId: "att-" + ++attachmentLocalCounter,
             file: decision.file,
@@ -659,11 +677,29 @@ export function createArtifactSdk(
             status: "uploading",
             id: "",
             error: "",
-            url: URL.createObjectURL(decision.file),
+            url: initialUrl,
           };
           items.push(item);
           toUpload.push(item);
           added = true;
+          const FileReaderClass = typeof globalThis.FileReader !== "undefined" ? globalThis.FileReader : null;
+          if (FileReaderClass) {
+            const reader = new FileReaderClass();
+            reader.onload = () => {
+              if (typeof reader.result === "string" && items.includes(item)) {
+                if (item.url && item.url.startsWith("blob:")) {
+                  try {
+                    URL.revokeObjectURL(item.url);
+                  } catch {
+                    // Ignore revoke errors
+                  }
+                }
+                item.url = reader.result;
+                render();
+              }
+            };
+            reader.readAsDataURL(decision.file);
+          }
         }
       }
       render();
@@ -674,7 +710,13 @@ export function createArtifactSdk(
     function removeAt(index) {
       const item = items[index];
       if (!item) return;
-      if (item.url) URL.revokeObjectURL(item.url);
+      if (item.url && item.url.startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(item.url);
+        } catch {
+          // Ignore revoke errors
+        }
+      }
       items.splice(index, 1);
       render();
     }
@@ -753,7 +795,15 @@ export function createArtifactSdk(
     }
 
     function destroy() {
-      for (const item of items) if (item.url) URL.revokeObjectURL(item.url);
+      for (const item of items) {
+        if (item.url && item.url.startsWith("blob:")) {
+          try {
+            URL.revokeObjectURL(item.url);
+          } catch {
+            // Ignore revoke errors
+          }
+        }
+      }
       items.length = 0;
     }
 
@@ -1153,9 +1203,9 @@ export function createArtifactSdk(
   }
 
   // Native interactive controls (radios, checkboxes, inputs, selects, buttons,
-  // labels, disclosure summaries, editable regions) should toggle/focus/type
-  // natively instead of triggering annotation, just like elements marked with
-  // data-lavish-action.
+  // labels, disclosure summaries, editable regions, interactive ARIA widgets)
+  // should toggle/focus/type natively instead of triggering annotation, just
+  // like elements marked with data-lavish-action.
   function isInteractiveControl(el) {
     return isNativeInteractive(el);
   }
@@ -1218,19 +1268,23 @@ export function createArtifactSdk(
     const markdown = markdownFromElement(element);
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(markdown);
-      } else {
-        const textarea = document.createElement("textarea");
-        textarea.value = markdown;
-        textarea.setAttribute("aria-hidden", "true");
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand?.("copy");
-        textarea.remove();
+        try {
+          await navigator.clipboard.writeText(markdown);
+          return true;
+        } catch {
+          // Fall back to execCommand when clipboard API is restricted in sandboxed iframe
+        }
       }
-      return true;
+      const textarea = document.createElement("textarea");
+      textarea.value = markdown;
+      textarea.setAttribute("aria-hidden", "true");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand?.("copy");
+      textarea.remove();
+      return Boolean(copied !== false);
     } catch {
       return false;
     }
@@ -1241,27 +1295,47 @@ export function createArtifactSdk(
     const rect = copyTarget.getBoundingClientRect();
     const viewportWidth = window.innerWidth || 0;
     const viewportHeight = window.innerHeight || 0;
-    const left = rect.right - 32;
-    const top = rect.top + 8;
+    const buttonWidth = 24;
+    const buttonHeight = 24;
+    const gap = 8;
+
     const onScreen =
-      top >= 0 &&
-      left >= 0 &&
-      top <= viewportHeight - 24 &&
-      left <= viewportWidth - 24 &&
-      rect.bottom > 0 &&
-      rect.right > 0;
+      rect.bottom > 16 && rect.top < viewportHeight - 16 && rect.right > 16 && rect.left < viewportWidth - 16;
     if (!onScreen) {
       hideCopyButton();
       return;
     }
+
+    let left = rect.right + gap;
+    let top = rect.height >= buttonHeight ? rect.top + 2 : rect.top + Math.round((rect.height - buttonHeight) / 2);
+
+    if (left + buttonWidth > viewportWidth - 8) {
+      if (rect.left - gap - buttonWidth >= 8) {
+        left = rect.left - gap - buttonWidth;
+      } else if (rect.top - buttonHeight - 4 >= 8) {
+        top = rect.top - buttonHeight - 4;
+        left = Math.max(8, Math.min(rect.right - buttonWidth, viewportWidth - buttonWidth - 8));
+      } else {
+        top = Math.max(8, rect.top + 2);
+        left = Math.max(8, Math.min(rect.right - buttonWidth - 4, viewportWidth - buttonWidth - 8));
+      }
+    }
+
+    top = Math.max(8, Math.min(top, viewportHeight - buttonHeight - 8));
+    left = Math.max(8, Math.min(left, viewportWidth - buttonWidth - 8));
+
     copyButton.hidden = false;
+    copyButton.style.display = "grid";
     copyButton.style.left = left + "px";
     copyButton.style.top = top + "px";
   }
 
   function hideCopyButton() {
     copyHideTimer = 0;
-    if (copyButton) copyButton.hidden = true;
+    if (copyButton) {
+      copyButton.hidden = true;
+      copyButton.style.display = "none";
+    }
     copyTarget = null;
   }
 
@@ -1279,7 +1353,7 @@ export function createArtifactSdk(
         if (copyHideTimer) window.clearTimeout(copyHideTimer);
       });
       copyButton.addEventListener("mouseleave", () => {
-        if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 120);
+        if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 160);
       });
       copyButton.addEventListener("click", async (event) => {
         event.preventDefault();
@@ -1299,6 +1373,7 @@ export function createArtifactSdk(
     if (copyHideTimer) window.clearTimeout(copyHideTimer);
     copyTarget = target;
     copyButton.hidden = false;
+    copyButton.style.display = "grid";
     positionCopyButton();
   }
 
@@ -1308,10 +1383,22 @@ export function createArtifactSdk(
       const style = document.createElement("style");
       style.id = styleId;
       style.textContent =
-        "nav a[data-lavish-active-nav='true'],.toc a[data-lavish-active-nav='true']{background:var(--lavish-nav-active-bg,rgba(244,201,93,.22))!important;color:var(--lavish-nav-active-ink,#fff)!important;box-shadow:inset 3px 0 0 var(--lavish-nav-active-accent,#f4c95d)}";
+        "nav a[data-lavish-active-nav='true'],.toc a[data-lavish-active-nav='true']{background:var(--lavish-nav-active-bg,rgba(244,201,93,.22))!important;color:var(--lavish-nav-active-ink,#fff)!important;box-shadow:inset 3px 0 0 var(--lavish-nav-active-accent,#f4c95d)}" +
+        ".rail,.review-rail,aside[class*='rail']{overflow-x:hidden!important;overscroll-behavior-x:none!important;left:0!important}" +
+        ".rail>*,.review-rail>*,aside[class*='rail']>*{min-width:0!important;max-width:100%!important;box-sizing:border-box!important}";
       document.head.appendChild(style);
     }
+    function clampRailScroll() {
+      const rails = document.querySelectorAll(".rail, .review-rail, aside[class*='rail']");
+      for (const r of rails) {
+        if (r.scrollLeft !== 0) {
+          r.scrollLeft = 0;
+        }
+      }
+    }
+    clampRailScroll();
     function update() {
+      clampRailScroll();
       const entries = [...document.querySelectorAll("nav a[href^='#'],.toc a[href^='#']")]
         .map((link) => ({ link, id: String(link.getAttribute("href") || "").slice(1) }))
         .map((entry) => ({ ...entry, section: entry.id ? document.getElementById(entry.id) : null }))
@@ -1332,13 +1419,14 @@ export function createArtifactSdk(
     }
     let frame = 0;
     const schedule = () => {
+      clampRailScroll();
       if (frame) return;
       frame = window.requestAnimationFrame(() => {
         frame = 0;
         update();
       });
     };
-    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("scroll", schedule, { passive: true, capture: true });
     window.addEventListener("resize", schedule, { passive: true });
     schedule();
     window.setTimeout(update, 0);
@@ -1381,7 +1469,7 @@ export function createArtifactSdk(
       style = document.createElement("style");
       style.id = "lavish-cursor-style";
       style.textContent =
-        ":root{--lavish-accent:#f4c95d;--lavish-annotate-outline:2px solid var(--lavish-accent);--lavish-annotate-offset:2px}*{cursor:default!important}[data-lavish-action],[data-lavish-action] *{cursor:pointer!important}input,textarea,[contenteditable]:not([contenteditable='false']){cursor:text!important}button,select,label,option,input[type='button'],input[type='submit'],input[type='reset'],input[type='checkbox'],input[type='radio'],input[type='file'],input[type='color'],input[type='range'],input[type='image']{cursor:pointer!important}";
+        ":root{--lavish-accent:#f4c95d;--lavish-annotate-outline:2px solid var(--lavish-accent);--lavish-annotate-offset:2px}*{cursor:default!important}:where(:is([role='button'],[role='checkbox'],[role='combobox'],[role='menuitem'],[role='menuitemcheckbox'],[role='menuitemradio'],[role='option'],[role='radio'],[role='switch'],[role='tab'],[role='treeitem']):not(a[href])),:where(:is([role='button'],[role='checkbox'],[role='combobox'],[role='menuitem'],[role='menuitemcheckbox'],[role='menuitemradio'],[role='option'],[role='radio'],[role='switch'],[role='tab'],[role='treeitem']):not(a[href])) *{cursor:pointer!important}:where(:is([role='button'],[role='checkbox'],[role='combobox'],[role='menuitem'],[role='menuitemcheckbox'],[role='menuitemradio'],[role='option'],[role='radio'],[role='switch'],[role='tab'],[role='treeitem']) a[href]),:where(:is([role='button'],[role='checkbox'],[role='combobox'],[role='menuitem'],[role='menuitemcheckbox'],[role='menuitemradio'],[role='option'],[role='radio'],[role='switch'],[role='tab'],[role='treeitem']) a[href]) *{cursor:default!important}[data-lavish-action],[data-lavish-action] *{cursor:pointer!important}input,textarea,[contenteditable]:not([contenteditable='false']){cursor:text!important}button,select,label,option,input[type='button'],input[type='submit'],input[type='reset'],input[type='checkbox'],input[type='radio'],input[type='file'],input[type='color'],input[type='range'],input[type='image']{cursor:pointer!important}";
       document.head.appendChild(style);
     }
     if (!annotationMode && style) style.remove();
@@ -1421,7 +1509,21 @@ export function createArtifactSdk(
       if (attachments.length) item.attachments = attachments;
     }
 
-    postArtifactMessage("lavish:queuePrompt", { prompt: item });
+    const questionScope = originElement.closest?.("[data-lavish-question]");
+    const requestId = questionScope ? "question-" + ++questionQueueSequence : "";
+    if (requestId) {
+      const keys = new Set(
+        lavishQuestionControls()
+          .filter((entry) => entry.scope === questionScope)
+          .map((entry) => entry.key),
+      );
+      pendingQuestionQueues.set(
+        requestId,
+        collectReviewState().fields.filter((field) => keys.has(field.key)),
+      );
+      if (pendingQuestionQueues.size > 200) pendingQuestionQueues.delete(pendingQuestionQueues.keys().next().value);
+    }
+    postArtifactMessage("lavish:queuePrompt", { prompt: item, review_request_id: requestId });
   }
 
   function sendQueuedPrompts() {
@@ -1556,12 +1658,28 @@ export function createArtifactSdk(
     return false;
   }
 
+  function hasIntentionalVerticalScrollerAncestor(el) {
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
+      if (isIntentionalVerticalScroller(node)) return true;
+      node = node.parentElement;
+    }
+    return false;
+  }
+
   function hasReachableVerticalScrollerAncestor(el) {
     let node = el?.parentElement;
+    const locked = rootVerticalScrollLocked();
+    const scrollY = locked ? 0 : Number(window.scrollY || window.pageYOffset || 0);
+    const pageBoundary = locked
+      ? window.innerHeight || 0
+      : document.documentElement.scrollHeight || window.innerHeight || 0;
     while (node && node !== document.body && node !== document.documentElement) {
       if (isIntentionalVerticalScroller(node)) {
         const rect = node.getBoundingClientRect();
-        if (rect.bottom > 0 && rect.top < (window.innerHeight || 0)) return true;
+        const top = rect.top + scrollY;
+        const bottom = rect.bottom + scrollY;
+        if (bottom > 0 && top < pageBoundary) return true;
       }
       node = node.parentElement;
     }
@@ -1872,11 +1990,14 @@ export function createArtifactSdk(
       fixedToViewport || lockedToViewport
         ? { top: 0, bottom: window.innerHeight || 0 }
         : { top: 0, bottom: document.documentElement.scrollHeight };
-    const vertical = classifyMaterialRectEscape({
-      rect: verticalRect,
-      boundary: verticalBoundary,
-      axes: ["vertical"],
-    });
+    const vertical =
+      hasReachableVerticalScrollerAncestor(el) || hasIntentionalVerticalScrollerAncestor(el)
+        ? null
+        : classifyMaterialRectEscape({
+            rect: verticalRect,
+            boundary: verticalBoundary,
+            axes: ["vertical"],
+          });
     if (vertical) {
       pushLayoutFinding(findings, seen, {
         selector: selector(el),
@@ -1938,6 +2059,30 @@ export function createArtifactSdk(
     return null;
   }
 
+  function isPointClippedByAncestor(el, point) {
+    let node = el?.parentElement;
+    while (node && node !== document.body && node !== document.documentElement) {
+      const style = getComputedStyle(node);
+      const clipsX =
+        style.overflowX === "hidden" ||
+        style.overflowX === "clip" ||
+        style.overflowX === "auto" ||
+        style.overflowX === "scroll";
+      const clipsY =
+        style.overflowY === "hidden" ||
+        style.overflowY === "clip" ||
+        style.overflowY === "auto" ||
+        style.overflowY === "scroll";
+      if (clipsX || clipsY) {
+        const box = paddingBoxRect(node);
+        if (clipsX && (point.x < box.left || point.x > box.right)) return true;
+        if (clipsY && (point.y < box.top || point.y > box.bottom)) return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+
   function fragmentSamplePoints(fragment) {
     const xs = [0.2, 0.5, 0.8];
     const ys = [0.2, 0.5, 0.8];
@@ -1971,6 +2116,7 @@ export function createArtifactSdk(
         if (rectArea(fragment) < 16) continue;
         for (const point of fragmentSamplePoints(fragment)) {
           if (point.x < 0 || point.y < 0 || point.x > viewportWidth || point.y > window.innerHeight) continue;
+          if (isPointClippedByAncestor(el, point)) continue;
           totalSamples += 1;
           const blocker = opaqueSiblingBlocker(el, point, animationTargets);
           if (blocker) blockers.set(blocker, (blockers.get(blocker) || 0) + 1);
@@ -2263,6 +2409,12 @@ export function createArtifactSdk(
   // ---------------------------------------------------------------------------
 
   let activeCardContext = null;
+  let questionQueueSequence = 0;
+  const pendingQuestionQueues = new Map();
+  const acknowledgedQuestionValues = new Map();
+  function fieldValueSignature(field) {
+    return JSON.stringify([field.context, field.value, field.checked, field.selectedValues]);
+  }
   let reviewStateTimer = 0;
   let draftRestoreTimer = 0;
   const REVIEW_DRAFT_ANCHOR_SETTLE_MS = 1500;
@@ -2296,6 +2448,7 @@ export function createArtifactSdk(
         if (["button", "submit", "reset", "file", "image", "password"].includes(type)) return;
         if (entries.length >= 200) return;
         entries.push({
+          scope,
           el: control,
           key: [
             question,
@@ -2308,6 +2461,17 @@ export function createArtifactSdk(
           index,
           question,
           type,
+          context: JSON.stringify([
+            String(scope.textContent || ""),
+            scope.getAttribute("data-lavish-question-context") || "",
+            scope.closest?.("[data-source-sha256]")?.getAttribute("data-source-sha256") || "",
+            controls.map((item) => [
+              item.getAttribute("name"),
+              item.getAttribute("type"),
+              item.getAttribute("value"),
+              item.textContent,
+            ]),
+          ]),
         });
       });
     }
@@ -2319,20 +2483,46 @@ export function createArtifactSdk(
     const textarea = card ? card.querySelector("textarea") : null;
     const text = textarea ? String(textarea.value || "") : "";
     return {
-      // A text-range card is anchored to a live Range, which a reload invalidates - restoring it
-      // could point the annotation at different text, so only element cards come back.
       card:
-        activeCardContext && activeCardContext.tag !== "text" && text.trim()
-          ? { selector: String(activeCardContext.selector || ""), text: text.slice(0, 4000) }
+        activeCardContext && text.trim()
+          ? {
+              selector: String(activeCardContext.selector || ""),
+              text: text.slice(0, 4000),
+              revision: artifactRevision,
+              unbound: activeCardContext.tag === "text",
+            }
           : null,
-      fields: lavishQuestionControls().map((entry) => ({
-        key: entry.key,
-        index: entry.index,
-        question: entry.question,
-        type: entry.type,
-        value: String(entry.el.value === undefined || entry.el.value === null ? "" : entry.el.value).slice(0, 2000),
-        checked: entry.type === "checkbox" || entry.type === "radio" ? Boolean(entry.el.checked) : null,
-      })),
+      attachmentsPending: Boolean(
+        activeAttachments &&
+        (activeAttachments.hasPending() || activeAttachments.hasErrors() || activeAttachments.hasReady()),
+      ),
+      fields: lavishQuestionControls()
+        .map((entry) => ({
+          key: entry.key,
+          index: entry.index,
+          question: entry.question,
+          type: entry.type,
+          context: entry.context,
+          selectedValues: entry.el.options ? [...entry.el.options].filter((o) => o.selected).map((o) => o.value) : null,
+          dirty: entry.el.options
+            ? [...entry.el.options].some(
+                (o, index, options) =>
+                  Boolean(o.selected) !==
+                  (Boolean(o.defaultSelected) ||
+                    (!entry.el.multiple && !options.some((option) => option.defaultSelected) && index === 0)),
+              )
+            : entry.type === "checkbox" || entry.type === "radio"
+              ? Boolean(entry.el.checked) !== Boolean(entry.el.defaultChecked)
+              : String(entry.el.value ?? "") !== String(entry.el.defaultValue ?? ""),
+          value: String(entry.el.value === undefined || entry.el.value === null ? "" : entry.el.value).slice(0, 2000),
+          checked: entry.type === "checkbox" || entry.type === "radio" ? Boolean(entry.el.checked) : null,
+        }))
+        .map((field) => ({
+          ...field,
+          dirty: acknowledgedQuestionValues.has(field.key)
+            ? acknowledgedQuestionValues.get(field.key) !== fieldValueSignature(field)
+            : field.dirty,
+        })),
     };
   }
 
@@ -2350,17 +2540,37 @@ export function createArtifactSdk(
     if (fields.length) {
       const entries = lavishQuestionControls();
       for (const field of fields) {
-        const match =
-          entries.find((entry) => entry.key === field.key) ||
-          entries.find((entry) => entry.question === field.question && entry.index === field.index);
-        if (!match) continue;
+        const match = entries.find((entry) => entry.key === field.key && entry.context === field.context);
+        if (!match) {
+          if (field.dirty || (!field.context && (field.value || field.checked))) {
+            postArtifactMessage("lavish:reviewDraftRecovered", {
+              field,
+              text:
+                String(field.question || "Question") +
+                ": " +
+                (Array.isArray(field.selectedValues)
+                  ? JSON.stringify(field.selectedValues)
+                  : field.checked !== null
+                    ? String(field.value || "") + " (checked: " + Boolean(field.checked) + ")"
+                    : String(field.value ?? "")),
+            });
+          }
+          continue;
+        }
         // No synthetic change/input events: the artifact's own handlers queue prompts, and
         // replaying them would silently re-queue answers the user already sent.
-        if (field.checked === null) match.el.value = String(field.value ?? "");
+        if (match.el.options && Array.isArray(field.selectedValues)) {
+          for (const option of match.el.options) option.selected = field.selectedValues.includes(option.value);
+        } else if (field.checked === null) match.el.value = String(field.value ?? "");
         else match.el.checked = Boolean(field.checked);
+        if (field.dirty === false) acknowledgedQuestionValues.set(field.key, fieldValueSignature(field));
       }
     }
     const card = state.card;
+    if (card && (card.unbound || (card.revision !== undefined && card.revision !== artifactRevision))) {
+      postArtifactMessage("lavish:reviewDraftRecovered", { card, text: String(card.text || "") });
+      return;
+    }
     if (!card || !card.selector || !String(card.text || "").trim()) return;
     const target = safeQuerySelector(card.selector);
     if (!target) {
@@ -2408,7 +2618,7 @@ export function createArtifactSdk(
 
     shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
-    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-copy-markdown{position:fixed;display:grid;place-items:center;width:24px;height:24px;padding:0;border:1px solid rgba(255,255,255,.28);border-radius:7px;background:rgba(17,20,26,.92);color:var(--cream-100);box-shadow:0 4px 14px rgba(0,0,0,.28);font:700 15px/1 var(--font-sans);cursor:pointer}.lavish-copy-markdown:hover{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-hint-alert{color:#ff9d7a;font-weight:700}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}.lavish-annotation-card.is-dropping{outline:2px dashed var(--accent);outline-offset:3px}.lavish-attachments{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:176px;overflow-y:auto}.lavish-attachment-chip{display:flex;align-items:center;gap:8px;padding:6px;border-radius:var(--radius-md);background:var(--bg);border:1px solid var(--border)}.lavish-attachment-chip.is-error{border-color:#e0623d}.lavish-attachment-thumb{width:32px;height:32px;border-radius:6px;object-fit:cover;background:var(--ink-700);flex:0 0 auto}.lavish-attachment-thumb-empty{display:inline-block}.lavish-attachment-body{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1 1 auto}.lavish-attachment-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lavish-attachment-status{font-size:11px;color:var(--fg-faint)}.lavish-attachment-status-error{color:#ff9d7a}.lavish-attachment-retry{flex:0 0 auto;padding:4px 8px;font-size:11px;font-weight:700;border-radius:8px;background:var(--steel-700);color:var(--fg);cursor:pointer;border:0}.lavish-attachment-remove{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0!important;border-radius:50%;background:transparent;color:rgba(255,255,255,.85);cursor:pointer;border:0}.lavish-attachment-remove:hover{background:rgba(255,255,255,.14);color:#fff}.lavish-attach-row{margin-top:8px}.lavish-attach{display:inline-flex;align-items:center;gap:6px;padding:6px 9px!important;background:var(--steel-700)!important;color:var(--fg)!important;font-size:12px!important}.lavish-attach:hover{background:var(--steel-600)!important}.lavish-reveal-marker{position:fixed;pointer-events:none;border:2px solid var(--accent);border-radius:4px;box-shadow:0 0 0 4px rgba(244,201,93,.22);animation:lavish-reveal-pulse 2.4s var(--ease,ease-out) forwards}@keyframes lavish-reveal-pulse{0%{opacity:0}12%{opacity:1}70%{opacity:1}100%{opacity:0}}`;
+    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-copy-markdown{position:fixed;display:grid;place-items:center;width:24px;height:24px;padding:0;border:1px solid rgba(255,255,255,.28);border-radius:7px;background:rgba(17,20,26,.92);color:var(--cream-100);box-shadow:0 4px 14px rgba(0,0,0,.28);font:700 15px/1 var(--font-sans);cursor:pointer;transition:opacity .12s ease}.lavish-copy-markdown:hover{background:var(--accent);color:var(--brass-ink)}.lavish-copy-markdown[hidden],.lavish-copy-markdown.is-hidden{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-hint-alert{color:#ff9d7a;font-weight:700}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}.lavish-annotation-card.is-dropping{outline:2px dashed var(--accent);outline-offset:3px}.lavish-attachments{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:176px;overflow-y:auto}.lavish-attachment-chip{display:flex;align-items:center;gap:8px;padding:6px;border-radius:var(--radius-md);background:var(--bg);border:1px solid var(--border)}.lavish-attachment-chip.is-error{border-color:#e0623d}.lavish-attachment-thumb{width:32px;height:32px;border-radius:6px;object-fit:cover;background:var(--ink-700);flex:0 0 auto}.lavish-attachment-thumb-empty{display:inline-block}.lavish-attachment-body{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1 1 auto}.lavish-attachment-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lavish-attachment-status{font-size:11px;color:var(--fg-faint)}.lavish-attachment-status-error{color:#ff9d7a}.lavish-attachment-retry{flex:0 0 auto;padding:4px 8px;font-size:11px;font-weight:700;border-radius:8px;background:var(--steel-700);color:var(--fg);cursor:pointer;border:0}.lavish-attachment-remove{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0!important;border-radius:50%;background:transparent;color:rgba(255,255,255,.85);cursor:pointer;border:0}.lavish-attachment-remove:hover{background:rgba(255,255,255,.14);color:#fff}.lavish-attach-row{margin-top:8px}.lavish-attach{display:inline-flex;align-items:center;gap:6px;padding:6px 9px!important;background:var(--steel-700)!important;color:var(--fg)!important;font-size:12px!important}.lavish-attach:hover{background:var(--steel-600)!important}.lavish-reveal-marker{position:fixed;pointer-events:none;border:2px solid var(--accent);border-radius:4px;box-shadow:0 0 0 4px rgba(244,201,93,.22);animation:lavish-reveal-pulse 2.4s var(--ease,ease-out) forwards}@keyframes lavish-reveal-pulse{0%{opacity:0}12%{opacity:1}70%{opacity:1}100%{opacity:0}}`;
     shadow.appendChild(style);
     return shadow;
   }
@@ -2542,7 +2752,13 @@ export function createArtifactSdk(
         attachNotice.classList.remove("lavish-hint-alert");
       }
     };
-    const attachments = makeAttachmentsController(attachmentsList, { notify, onLayout: positionCard });
+    const attachments = makeAttachmentsController(attachmentsList, {
+      notify,
+      onLayout() {
+        positionCard();
+        scheduleReviewStateReport();
+      },
+    });
     activeAttachments = attachments;
 
     attachButton.onclick = () => attachInput.click();
@@ -2678,7 +2894,32 @@ export function createArtifactSdk(
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);
     }
     if (msg.type === "lavish:restoreReviewState") restoreReviewState(msg.state);
+    if (msg.type === "lavish:questionQueued") {
+      const fields = pendingQuestionQueues.get(msg.review_request_id);
+      pendingQuestionQueues.delete(msg.review_request_id);
+      if (msg.accepted && fields) {
+        for (const field of fields) acknowledgedQuestionValues.set(field.key, fieldValueSignature(field));
+        scheduleReviewStateReport();
+      }
+    }
+    if (msg.type === "lavish:requestReviewState") {
+      if (msg.freeze) document.documentElement.inert = true;
+      postArtifactMessage("lavish:reviewState", {
+        request_id: String(msg.request_id || ""),
+        state: collectReviewState(),
+      });
+    }
+    if (msg.type === "lavish:releaseReviewState") document.documentElement.inert = false;
     if (msg.type === "lavish:revealElement") revealElement(msg.selector);
+    if (msg.type === "lavish:copyUrlResult") handleCopyUrlResult(msg);
+    if (msg.type === "lavish:accessUrls") updateAccessUrls(msg);
+    if (msg.type === "lavish:queuedAnchors") {
+      queuedAnchorSelectors = new Set(Array.isArray(msg.selectors) ? msg.selectors.map(String) : []);
+    }
+    if (msg.type === "lavish:annotateElement" && annotationMode) {
+      const target = safeQuerySelector(msg.selector);
+      if (target) showAnnotationCard(target);
+    }
   });
 
   // Bring a warning's element into view and flash it. The marker is Lavish UI, so it is excluded
@@ -2738,7 +2979,7 @@ export function createArtifactSdk(
         return;
       }
       if (copyTarget && copyButton && !copyButton.contains?.(event.target) && !isLavishUi(event.target)) {
-        if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 80);
+        if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 160);
       }
     },
     true,
@@ -2750,10 +2991,17 @@ export function createArtifactSdk(
       if (!copyTarget || !copyButton || copyButton.contains?.(event.relatedTarget)) return;
       const nextTarget = copyTargetFor(event.relatedTarget);
       if (nextTarget === copyTarget) return;
-      if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 120);
+      if (!copyHideTimer) copyHideTimer = window.setTimeout(hideCopyButton, 160);
     },
     true,
   );
+
+  document.addEventListener("mouseleave", () => {
+    hideCopyButton();
+  });
+  window.addEventListener("blur", () => {
+    hideCopyButton();
+  });
 
   window.addEventListener("resize", positionCopyButton, { passive: true });
   window.addEventListener("scroll", positionCopyButton, { passive: true });
@@ -2808,6 +3056,203 @@ export function createArtifactSdk(
     true,
   );
 
+  let copyBridgeRequestCounter = 0;
+  /** @type {Map<number, { button: HTMLElement, timer: any }>} */
+  const activeCopyBridgeRequests = new Map();
+  /** @type {WeakMap<HTMLElement, string>} */
+  const origButtonHtml = new WeakMap();
+  /** @type {WeakMap<HTMLElement, any>} */
+  const buttonResetTimers = new WeakMap();
+
+  function findCopyTarget(element) {
+    if (!element || !(element instanceof Element)) return null;
+    if (element.closest("button:disabled, [aria-disabled='true']")) return null;
+    if (element.closest("a[href]")) return null;
+
+    // 1. New template button contract: data-lavish-copy-url
+    const copyUrlEl = /** @type {HTMLElement | null} */ (element.closest("[data-lavish-copy-url]"));
+    if (copyUrlEl) {
+      const url = copyUrlEl.getAttribute("data-lavish-copy-url") || "";
+      if (url) return { element: copyUrlEl, url };
+    }
+
+    // 2. Existing access-card copy buttons
+    const accessCard = element.closest(".lavish-access-card");
+    if (accessCard) {
+      const btn = /** @type {HTMLElement | null} */ (element.closest("button, [role='button']"));
+      if (btn) {
+        let url =
+          btn.getAttribute("data-lavish-copy-url") ||
+          btn.getAttribute("data-copy-url") ||
+          btn.getAttribute("data-copy-text");
+
+        if (!url) {
+          const onclickAttr = btn.getAttribute("onclick") || "";
+          const match = onclickAttr.match(/(?:writeText|copyText)\(\s*['"]([^'"]+)['"]\s*\)/i);
+          if (match) url = match[1];
+        }
+
+        if (!url) {
+          const row = btn.closest("div, li, tr, p") || accessCard;
+          const codeEl = /** @type {HTMLInputElement | HTMLElement | null} */ (
+            row.querySelector("code, input, a[href^='http']")
+          );
+          if (codeEl) {
+            const input = /** @type {HTMLInputElement} */ (codeEl);
+            const val = String(
+              codeEl.tagName === "INPUT" ? input.value : codeEl.textContent || codeEl.getAttribute("href") || "",
+            ).trim();
+            if (/^https?:\/\//i.test(val)) url = val;
+          }
+        }
+
+        if (url) return { element: btn, url };
+      }
+    }
+
+    return null;
+  }
+
+  function updateAccessUrls(msg) {
+    const urls = [String(msg.localUrl || ""), String(msg.remoteUrl || "")];
+    document.querySelectorAll(".lavish-access-card").forEach((card) => {
+      Array.from(card.querySelectorAll("code"))
+        .slice(0, 2)
+        .forEach((code, index) => {
+          const row = code.parentElement?.parentElement;
+          if (!row) return;
+          const url = urls[index];
+          code.textContent = url || "Remote nicht verfügbar";
+          const button = row.querySelector("button");
+          if (button) {
+            button.removeAttribute("onclick");
+            button.setAttribute("data-lavish-copy-url", url);
+            button.setAttribute("data-copy-label", index === 0 ? "Local" : "Remote");
+            button.disabled = !url;
+          }
+          row.querySelectorAll("a").forEach((link) => {
+            if (url) link.setAttribute("href", url);
+            else link.removeAttribute("href");
+            link.setAttribute("data-lavish-action", "link");
+            link.setAttribute("target", "_blank");
+            link.setAttribute("rel", "noopener noreferrer");
+          });
+        });
+    });
+  }
+
+  function applyCopyButtonFeedback(button, success) {
+    if (!button) return;
+    const isGerman = /kopier/i.test(button.getAttribute("onclick") || button.textContent || "");
+    button.classList.remove("copying");
+    const card = button.closest(".lavish-access-card");
+    if (card) {
+      let status = card.querySelector("[data-lavish-copy-status]");
+      if (!status) {
+        status = document.createElement("p");
+        status.setAttribute("data-lavish-copy-status", "");
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        card.appendChild(status);
+      }
+      status.textContent = success
+        ? `${button.getAttribute("data-copy-label") || "Session"}-Adresse kopiert ✓`
+        : "Kopieren fehlgeschlagen. Adresse auswählen und manuell kopieren.";
+    }
+    if (success) {
+      button.classList.remove("copy-error");
+      button.classList.add("copied");
+    } else {
+      button.classList.remove("copied");
+      button.classList.add("copy-error");
+    }
+
+    const hint = button.querySelector(".copy-canonical-hint, .copy-hint, .copy-status");
+    if (hint) {
+      hint.textContent = success ? (isGerman ? "✓ Kopiert" : "Copied") : isGerman ? "Fehler" : "Error";
+    } else {
+      const textNode = Array.from(button.childNodes).find((node) => node.nodeType === 3 && node.textContent?.trim());
+      if (textNode) {
+        textNode.textContent = success ? (isGerman ? "✓ Kopiert" : "Copied") : isGerman ? "Fehler" : "Error";
+      } else {
+        button.textContent = success ? (isGerman ? "✓ Kopiert" : "Copied") : isGerman ? "Fehler" : "Error";
+      }
+    }
+
+    const prevTimer = buttonResetTimers.get(button);
+    if (prevTimer) window.clearTimeout(prevTimer);
+
+    const resetTimer = window.setTimeout(() => {
+      button.classList.remove("copied", "copy-error");
+      const origHtml = origButtonHtml.get(button);
+      if (origHtml !== undefined) {
+        button.innerHTML = origHtml;
+        origButtonHtml.delete(button);
+      }
+    }, 2000);
+    buttonResetTimers.set(button, resetTimer);
+  }
+
+  function handleCopyUrlResult(msg) {
+    const req = activeCopyBridgeRequests.get(Number(msg.requestId));
+    if (req) {
+      window.clearTimeout(req.timer);
+      activeCopyBridgeRequests.delete(Number(msg.requestId));
+      applyCopyButtonFeedback(req.button, Boolean(msg.success));
+    }
+  }
+
+  function executeCopyBridge(button, url) {
+    if (!button || !url) return;
+    if (!origButtonHtml.has(button)) {
+      origButtonHtml.set(button, button.innerHTML);
+    }
+    button.classList.add("copying");
+
+    const requestId = ++copyBridgeRequestCounter;
+    const timer = window.setTimeout(() => {
+      activeCopyBridgeRequests.delete(requestId);
+      applyCopyButtonFeedback(button, false);
+    }, 3000);
+
+    activeCopyBridgeRequests.set(requestId, { button, timer });
+
+    if (parent && parent !== window) {
+      postArtifactMessage("lavish:copyUrl", { requestId, url });
+    } else {
+      (async () => {
+        let ok = false;
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(url);
+            ok = true;
+          }
+        } catch {
+          // Fall through
+        }
+        window.clearTimeout(timer);
+        activeCopyBridgeRequests.delete(requestId);
+        applyCopyButtonFeedback(button, ok);
+      })();
+    }
+  }
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      if (!event.isTrusted || event.defaultPrevented) return;
+      const copyTarget = findCopyTarget(event.target);
+      if (!copyTarget) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+
+      executeCopyBridge(copyTarget.element, copyTarget.url);
+    },
+    true,
+  );
+
   document.addEventListener(
     "click",
     (event) => {
@@ -2836,6 +3281,16 @@ export function createArtifactSdk(
       event.stopPropagation();
       if (ignoreNextClick) {
         ignoreNextClick = false;
+        return;
+      }
+      // The clicked element's own selector, plus its diagram node's, so any click inside a node
+      // finds the node's note again. A table cell's note stays on the exact element clicked.
+      const clicked = queuedAnchorSelectors.size ? context(event.target) : null;
+      const node = clicked?.target?.type === "mermaid-node" ? clicked.target.selector : "";
+      const selector = [clicked?.selector, node].find((candidate) => candidate && queuedAnchorSelectors.has(candidate));
+      if (selector) {
+        closeCard();
+        postArtifactMessage("lavish:editQueuedAnchor", { selector });
         return;
       }
       showAnnotationCard(event.target);
@@ -2884,4 +3339,64 @@ export function createArtifactSdk(
   }
   const mermaidObserver = new MutationObserver(() => scheduleMermaidEnhance());
   mermaidObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // Sync document title and favicon to parent chrome (especially for SPAs and wrapped apps)
+  function syncDocumentMetadata() {
+    try {
+      const currentTitle = (document.title || "").trim();
+      let iconHref = "";
+      const iconLinks = /** @type {HTMLLinkElement[]} */ (Array.from(document.querySelectorAll("link[rel~='icon']")));
+      const preferredIcon =
+        iconLinks.find((l) => /svg/i.test(l.type || l.href)) ||
+        iconLinks.find((l) => /png/i.test(l.type || l.href)) ||
+        iconLinks[0];
+      if (preferredIcon && preferredIcon.href) {
+        iconHref = preferredIcon.href;
+      }
+      postArtifactMessage("lavish:documentMeta", {
+        title: currentTitle,
+        faviconHref: iconHref,
+      });
+    } catch {
+      // Ignore frame read failures
+    }
+  }
+
+  syncDocumentMetadata();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", syncDocumentMetadata, { once: true });
+  }
+  window.addEventListener("load", syncDocumentMetadata, { once: true });
+
+  try {
+    const metaObserver = new MutationObserver(() => syncDocumentMetadata());
+    if (document.head) {
+      metaObserver.observe(document.head, { childList: true, subtree: true, characterData: true });
+    }
+    if (document.documentElement) {
+      metaObserver.observe(document.documentElement, { childList: true });
+    }
+  } catch {
+    // Ignore observer failures in restricted environments
+  }
+
+  // Report the agent-declared revision registry so the chrome can offer its
+  // legend. Read-only: the SDK never marks up the page for it, because a
+  // highlight painted here would make the served artifact differ from the file
+  // opened without Lavish. The message is sent even when the artifact declares
+  // nothing, so a reload that removed the registry clears a stale legend.
+  function reportArtifactRevisions() {
+    let payload = { revisions: [], marks: [] };
+    try {
+      payload = readArtifactRevisions(document);
+    } catch {
+      // A malformed registry costs the reader a legend, never the review.
+    }
+    postArtifactMessage("lavish:revisions", payload);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", reportArtifactRevisions, { once: true });
+  } else {
+    reportArtifactRevisions();
+  }
 }

@@ -105,7 +105,9 @@ test("malformed links and images stay literal without stalling", () => {
   assert.equal(renderChatMarkdown(recursiveLinks), `<p>${recursiveLinks}</p>`);
   assert.equal(renderChatMarkdown(nestedDestination), `<p>${nestedDestination}</p>`);
   const elapsed = performance.now() - started;
-  assert.ok(elapsed < 1_000, `render took ${Math.round(elapsed)}ms`);
+  // Catastrophic backtracking would blow this budget by orders of magnitude;
+  // the wide margin absorbs slower/shared CI runners (observed ~1.1s on windows-latest).
+  assert.ok(elapsed < 10_000, `render took ${Math.round(elapsed)}ms`);
 });
 
 test("destinations beyond the inline limit remain literal", () => {

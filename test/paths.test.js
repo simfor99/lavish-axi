@@ -1,7 +1,70 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { bindHost, clientHost, extraAllowedHosts, hostForUrl, LOOPBACK_HOST, linkHost } from "../src/paths.js";
+import {
+  bindHost,
+  clientHost,
+  extraAllowedHosts,
+  hostForUrl,
+  isLoopbackHost,
+  LOOPBACK_HOST,
+  linkHost,
+  resolveLinkHost,
+} from "../src/paths.js";
+
+test("isLoopbackHost identifies loopback addresses and rejects remote/network hosts", () => {
+  assert.equal(isLoopbackHost("127.0.0.1"), true);
+  assert.equal(isLoopbackHost("localhost"), true);
+  assert.equal(isLoopbackHost("::1"), true);
+  assert.equal(isLoopbackHost("[::1]"), true);
+  assert.equal(isLoopbackHost("sub.localhost"), true);
+  assert.equal(isLoopbackHost("127.0.1.1"), true);
+  assert.equal(isLoopbackHost("ryzen.tail0df162.ts.net"), false);
+  assert.equal(isLoopbackHost("100.64.0.1"), false);
+  assert.equal(isLoopbackHost("192.168.1.1"), false);
+  assert.equal(isLoopbackHost("example.com"), false);
+  assert.equal(isLoopbackHost(""), false);
+  assert.equal(isLoopbackHost(null), false);
+});
+
+test("resolveLinkHost prioritizes explicit LAVISH_AXI_LINK_HOST before Tailscale MagicDNS", () => {
+  assert.equal(resolveLinkHost({}), LOOPBACK_HOST);
+  assert.equal(
+    resolveLinkHost({
+      env: { LAVISH_AXI_LINK_HOST: "custom.example" },
+      tailscale: { magicDnsName: "ryzen.tail0df162.ts.net" },
+    }),
+    "custom.example",
+  );
+  assert.equal(
+    resolveLinkHost({
+      env: { LAVISH_AXI_LINK_HOST: "127.0.0.1" },
+      tailscale: { magicDnsName: "ryzen.tail0df162.ts.net" },
+    }),
+    "127.0.0.1",
+  );
+  assert.equal(
+    resolveLinkHost({
+      env: {},
+      tailscale: { magicDnsName: "ryzen.tail0df162.ts.net" },
+    }),
+    "ryzen.tail0df162.ts.net",
+  );
+  assert.equal(
+    resolveLinkHost({
+      env: {},
+      fallbackHost: "192.168.1.5",
+    }),
+    "192.168.1.5",
+  );
+  assert.equal(
+    resolveLinkHost({
+      env: {},
+      fallbackHost: "0.0.0.0",
+    }),
+    LOOPBACK_HOST,
+  );
+});
 
 test("bindHost defaults to loopback and honors LAVISH_AXI_HOST", () => {
   assert.equal(bindHost({}), LOOPBACK_HOST);

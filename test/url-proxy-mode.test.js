@@ -67,11 +67,23 @@ test("transformProxyHtml injects base tag, bootstrap script, and Lavish SDK", ()
   assert.match(transformed, /window\.localStorage/);
   assert.match(transformed, /window\.fetch/);
   assert.match(transformed, /XMLHttpRequest\.prototype\.open/);
+  assert.match(transformed, /var targetPath = "\/setup";/);
+  assert.match(transformed, /window\.history\.replaceState\(window\.history\.state, "", targetPath\)/);
   assert.match(transformed, /history\.pushState/);
   assert.match(
     transformed,
     /<script src="\/sdk\.js\?key=key123&artifact_revision=1&artifact_load_token=tok-1"><\/script><\/body>/,
   );
+});
+
+test("transformProxyHtml strips upstream Content-Security-Policy and X-Frame-Options meta tags", () => {
+  const inputHtml = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https:;"><meta content="DENY" http-equiv="X-Frame-Options"><title>App</title></head><body><h1>Content</h1></body></html>`;
+  const transformed = transformProxyHtml(inputHtml, "key123", "http://127.0.0.1:8000/setup", 1, "tok-1");
+
+  assert.doesNotMatch(transformed, /content-security-policy/i);
+  assert.doesNotMatch(transformed, /x-frame-options/i);
+  assert.match(transformed, /<meta charset="utf-8">/);
+  assert.match(transformed, /<title>App<\/title>/);
 });
 
 test("Lavish server URL proxy mode: end-to-end session, iframe sandbox, index proxy, and API forwarding", async () => {
@@ -221,6 +233,22 @@ test("Lavish server URL proxy mode: end-to-end session, iframe sandbox, index pr
     assert.equal(fallbackRes.status, 302);
     assert.equal(fallbackRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
 
+    // 8b. Test root-relative subresource redirection via Referer (ES modules / Vite / SPA assets)
+    const refererRes = await fetch(`${lavishBase}/assets/style.css`, {
+      headers: { referer: `${lavishBase}/artifact/${key}/proxy/setup` },
+      redirect: "manual",
+    });
+    assert.equal(refererRes.status, 307);
+    assert.equal(refererRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
+
+    // 8c. Test root-relative subresource redirection via Cookie fallback
+    const cookieRes = await fetch(`${lavishBase}/assets/style.css`, {
+      headers: { cookie: `lavish_proxy_session=${key}` },
+      redirect: "manual",
+    });
+    assert.equal(cookieRes.status, 307);
+    assert.equal(cookieRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
+
     // 9. Close target server to simulate upstream crash/outage
     await new Promise((resolve) => targetServer.close(resolve));
 
@@ -253,4 +281,44 @@ test("openCommand rejects recursive self-wrapping of Lavish session URLs", async
       return true;
     },
   );
+});
+
+test("Lavish session custom title persistence and chrome rendering", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-title-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  let lavish;
+  try {
+    lavish = await serve({ port: 0, stateFile: stateFilePath, version: "0.1.70" });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+
+    // 1. Open session with custom title
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: "http://127.0.0.1:9999/app/audits/123",
+        title: "Kundenfläche Stage 2a Reparatur",
+      }),
+    });
+    assert.equal(openRes.status, 200);
+    const openData = await openRes.json();
+    assert.equal(openData.custom_title, "Kundenfläche Stage 2a Reparatur");
+
+    // 2. Fetch chrome HTML and verify <title> and customTitle in session JSON
+    const sessionRes = await fetch(`${lavishBase}/session/${openData.key}`);
+    assert.equal(sessionRes.status, 200);
+    const sessionHtml = await sessionRes.text();
+    assert.match(sessionHtml, /<title>Kundenfläche Stage 2a Reparatur · Lavish<\/title>/);
+    assert.match(sessionHtml, /"customTitle":"Kundenfläche Stage 2a Reparatur"/);
+
+    // 3. Verify query parameter ?title= overrides title on the fly
+    const overrideRes = await fetch(`${lavishBase}/session/${openData.key}?title=Adhoc+Title`);
+    assert.equal(overrideRes.status, 200);
+    const overrideHtml = await overrideRes.text();
+    assert.match(overrideHtml, /<title>Adhoc Title · Lavish<\/title>/);
+    assert.match(overrideHtml, /"customTitle":"Adhoc Title"/);
+  } finally {
+    if (lavish) await lavish.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

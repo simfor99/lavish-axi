@@ -4,7 +4,27 @@ const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
+function readLocationTitle() {
+  try {
+    if (typeof URLSearchParams !== "undefined" && typeof location !== "undefined" && location.search) {
+      return new URLSearchParams(location.search).get("title") || "";
+    }
+  } catch {
+    // Ignore test environment or malformed URL
+  }
+  return "";
+}
+const customTitle = String(readLocationTitle() || sessionData.customTitle || "").trim();
+if (customTitle) {
+  const suffix = " · Lavish";
+  const targetTitle = customTitle.endsWith(suffix) ? customTitle : `${customTitle}${suffix}`;
+  if (document.title !== targetTitle) {
+    document.title = targetTitle;
+  }
+}
 const sourceMarkdownPath = String(sessionData.sourceMarkdownPath || "");
+const localAccessUrl = String(sessionData.localAccessUrl || "");
+const remoteAccessUrl = String(sessionData.remoteAccessUrl || "");
 const queueStorageKey = "lavish-axi:queued:" + key;
 const terminalStorageKey = "lavish-axi:terminal:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
@@ -174,6 +194,16 @@ const sourceMarkdownCopyHint = /** @type {HTMLSpanElement | null} */ (
 const sourceMarkdownCopyHintText = /** @type {HTMLSpanElement | null} */ (
   document.getElementById("sourceMarkdownCopyHintText")
 );
+const copyLocalAccessButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("copyLocalAccess"));
+const copyLocalAccessHint = /** @type {HTMLSpanElement | null} */ (document.getElementById("copyLocalAccessHint"));
+const copyLocalAccessHintText = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("copyLocalAccessHintText")
+);
+const copyRemoteAccessButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("copyRemoteAccess"));
+const copyRemoteAccessHint = /** @type {HTMLSpanElement | null} */ (document.getElementById("copyRemoteAccessHint"));
+const copyRemoteAccessHintText = /** @type {HTMLSpanElement | null} */ (
+  document.getElementById("copyRemoteAccessHintText")
+);
 const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("presenceBanner"));
 const handoffBanner = /** @type {HTMLDivElement} */ (document.getElementById("handoffBanner"));
 const handoffTakeoverButton = /** @type {HTMLButtonElement} */ (document.getElementById("handoffTakeover"));
@@ -197,6 +227,12 @@ const warningsSelectAll = /** @type {HTMLInputElement} */ (document.getElementBy
 const warningsSelected = /** @type {HTMLSpanElement} */ (document.getElementById("warningsSelected"));
 const warningsList = /** @type {HTMLDivElement} */ (document.getElementById("warningsList"));
 const warningsQueueButton = /** @type {HTMLButtonElement} */ (document.getElementById("warningsQueueButton"));
+const revisionsWrap = /** @type {HTMLDivElement} */ (document.getElementById("revisionsWrap"));
+const revisionsButton = /** @type {HTMLButtonElement} */ (document.getElementById("revisionsButton"));
+const revisionsCount = /** @type {HTMLSpanElement} */ (document.getElementById("revisionsCount"));
+const revisionsDrawer = /** @type {HTMLDivElement} */ (document.getElementById("revisionsDrawer"));
+const revisionsSummary = /** @type {HTMLParagraphElement} */ (document.getElementById("revisionsSummary"));
+const revisionsList = /** @type {HTMLDivElement} */ (document.getElementById("revisionsList"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
@@ -217,6 +253,16 @@ const layoutGateMaxHoldMs =
 let chromeOutdatedReason = "";
 let chromeOutdatedGeneration = 0;
 let outdatedReloadInFlight = false;
+// The live-event socket reconnects forever on a 5s cap. Silence there is indistinguishable from a
+// healthy idle stream, so a page whose server has gone away keeps rendering its last state and
+// tells the user nothing until they reload into a connection error. Past this many consecutive
+// failures the banner says so, with the health-probed reload the banner already offers.
+const LIVE_EVENT_UNREACHABLE_FAILURES = 5;
+let liveEventFailures = 0;
+// Only a banner this path raised may be hidden by this path: a `chrome-outdated` event means the
+// server was replaced, which a reconnect does not disprove.
+let unreachableBannerOwned = false;
+let unreachableDismissed = false;
 /** @type {{ selector: string, revision: number } | null} */
 let unrestorableDraftMiss = null;
 let retiredDrafts = loadRetiredDrafts();
@@ -264,6 +310,12 @@ let terminalSubmission =
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
+// The queued note open for editing in the panel, by prompt identity, and its unsaved words.
+let editingPromptId = "";
+let editingDraft = "";
+let editFocusPending = false;
+// The selector list last told to the artifact, so a render that changes nothing stays quiet.
+let postedQueuedAnchors = "[]";
 // In-iframe review context (an open annotation card's unsent text, Lavish-owned question
 // answers). The sandbox means the chrome cannot read it back after a reload, so the SDK reports
 // it as it changes and the chrome replays it once the new document is up. It is persisted per
@@ -541,6 +593,8 @@ function persistTerminalReservation(reserved) {
 
 const REMOVE_ICON_SVG =
   '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const EDIT_ICON_SVG =
+  '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M6.5 1.5L8.5 3.5L3.5 8.5H1.5V6.5L6.5 1.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
 const ANCHOR_EXCERPT_MAX = 120;
 const ANCHOR_SELECTOR_MAX = 512;
 const ANCHOR_LABEL_MAX = 40;
@@ -642,20 +696,48 @@ function userBubbleTextHtml(entry, text) {
 }
 
 // A queued note is the user bubble in its not-yet-sent state: dashed, labelled Queued (Sending
-// while its batch is in flight), and removable until then. It settles in place as a sent bubble
-// once the server's transcript carries it, so nothing moves between regions.
+// while its batch is in flight), and editable and removable until then. It settles in place as a
+// sent bubble once the server's transcript carries it, so nothing moves between regions.
 function queuedBubbleHtml(prompt, index) {
   const sending = isPromptSending(prompt);
+  if (!sending && editingPromptId && promptIdentity(prompt) === editingPromptId) {
+    return queuedEditorHtml(prompt, index);
+  }
   return (
-    '<div class="bubble user queued"><small>' +
+    '<div class="bubble user queued" data-index="' +
+    index +
+    '"><small>' +
     (sending ? "Sending\u2026" : "Queued") +
-    ' <button class="queued-remove" type="button" aria-label="Remove queued prompt" data-index="' +
+    ' <button class="queued-edit" type="button" aria-label="Edit queued prompt" data-index="' +
+    index +
+    '">' +
+    EDIT_ICON_SVG +
+    '</button><button class="queued-remove" type="button" aria-label="Remove queued prompt" data-index="' +
     index +
     '">' +
     REMOVE_ICON_SVG +
     "</button></small>" +
     anchorHtml(promptAnchor(prompt)) +
     userBubbleTextHtml(prompt, prompt.prompt) +
+    bubbleAttachmentsHtml(prompt) +
+    "</div>"
+  );
+}
+
+// The same bubble while its words are being revised. The anchor and images stay as they were:
+// an edit changes what the note says, not what it points at.
+function queuedEditorHtml(prompt, index) {
+  return (
+    '<div class="bubble user queued editing" data-index="' +
+    index +
+    '"><small>Editing</small>' +
+    anchorHtml(promptAnchor(prompt)) +
+    '<textarea class="queued-edit-input" aria-label="Edit queued prompt" data-index="' +
+    index +
+    '">' +
+    escapeHtml(editingDraft) +
+    '</textarea><div class="queued-edit-actions"><button class="queued-edit-cancel" type="button">Cancel</button>' +
+    '<button class="queued-edit-save" type="button">Save</button></div>' +
     bubbleAttachmentsHtml(prompt) +
     "</div>"
   );
@@ -679,6 +761,23 @@ function isPromptSending(prompt) {
 }
 
 function render() {
+  const editing = editingPromptId ? queued.find((prompt) => promptIdentity(prompt) === editingPromptId) : null;
+  // A note that left the queue or started sending takes its editor with it.
+  if (editingPromptId && (!editing || !isPromptEditable(editing))) endQueuedEdit();
+  const keepEditFocus = editFocusPending || queuedLog.contains(document.activeElement);
+  // A re-render while the reviewer is typing keeps their caret and scroll; only a freshly opened
+  // edit starts at the end of its words.
+  const previousInput = /** @type {HTMLTextAreaElement | null} */ (queuedLog.querySelector(".queued-edit-input"));
+  const caret =
+    !editFocusPending && previousInput && previousInput === document.activeElement
+      ? {
+          start: previousInput.selectionStart,
+          end: previousInput.selectionEnd,
+          direction: previousInput.selectionDirection,
+          scrollTop: previousInput.scrollTop,
+        }
+      : null;
+  editFocusPending = false;
   queuedLog.innerHTML = queued.map((prompt, index) => queuedBubbleHtml(prompt, index)).join("");
 
   for (const button of queuedLog.querySelectorAll(".queued-remove")) {
@@ -687,6 +786,23 @@ function render() {
     removeButton.disabled = terminalSubmission !== null || isPromptSending(prompt);
     removeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(removeButton.dataset.index), event));
   }
+  for (const button of queuedLog.querySelectorAll(".queued-edit")) {
+    const editButton = /** @type {HTMLButtonElement} */ (button);
+    editButton.disabled = !isPromptEditable(queued[Number(editButton.dataset.index)]);
+  }
+  if (editingPromptId && keepEditFocus) {
+    const input = /** @type {HTMLTextAreaElement | null} */ (queuedLog.querySelector(".queued-edit-input"));
+    if (input) {
+      input.focus();
+      if (caret) {
+        input.setSelectionRange?.(caret.start, caret.end, caret.direction);
+        input.scrollTop = caret.scrollTop;
+      } else {
+        input.setSelectionRange?.(input.value.length, input.value.length);
+      }
+    }
+  }
+  postQueuedAnchors();
   updateSendState();
   scrollPanelToBottom();
   renderSheetSummary();
@@ -862,6 +978,7 @@ function toggleMenu(button, menu) {
 }
 
 async function copyText(text) {
+  if (!text) return false;
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(text);
@@ -870,15 +987,23 @@ async function copyText(text) {
   } catch {
     // Fall through to the textarea-based fallback below.
   }
+  const focused = /** @type {HTMLElement | null} */ (document.activeElement);
   const helper = document.createElement("textarea");
-  helper.value = text;
-  helper.style.position = "fixed";
-  helper.style.opacity = "0";
-  document.body.appendChild(helper);
-  helper.select();
-  document.execCommand("copy");
-  helper.remove();
-  return true;
+  try {
+    helper.value = text;
+    helper.style.position = "fixed";
+    helper.style.opacity = "0";
+    document.body.appendChild(helper);
+    helper.focus({ preventScroll: true });
+    helper.select();
+    const result = document.execCommand("copy");
+    return result === true;
+  } catch {
+    return false;
+  } finally {
+    helper.remove();
+    focused?.focus?.({ preventScroll: true });
+  }
 }
 
 // One transcript entry, as the server serialized it (src/chat-messages.js). An agent entry's
@@ -1049,12 +1174,14 @@ function syncChat(chat, revision) {
 }
 
 function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "working" ? state : "waiting";
+  agentPresence = state === "listening" || state === "external" || state === "working" ? state : "waiting";
   updateSendState();
   renderSheetSummary();
   if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
 
-  if (agentPresence !== "working") {
+  // A supervisor-owned process-only listener is busy on the agent's behalf. It must not make the
+  // composer look like an idle captain turn while the owning agent is offline.
+  if (agentPresence !== "working" && agentPresence !== "external") {
     if (workingBubble) workingBubble.remove();
     workingBubble = null;
     return;
@@ -1078,6 +1205,8 @@ function setHandoffSuperseded(visible) {
 // after a deliberate stop is being told something false. An unnamed reason (SIGTERM, or any
 // caller that names none) claims neither.
 function chromeOutdatedCopy(reason) {
+  if (reason === "draft-revision")
+    return "A new revision is available. Your unfinished input stays on this revision until you choose to reload.";
   if (reason === "upgrade") return "Lavish was updated. This page is running the previous version.";
   if (reason === "local-build") {
     return "Lavish was restarted to pick up a local build. This page is running the copy the previous server sent.";
@@ -1098,10 +1227,17 @@ function setChromeOutdated(visible, reason = chromeOutdatedReason) {
 }
 
 function setReviewState(state) {
+  // If the separate recovery store refused a write, carry its text beside
+  // current fields so later field messages cannot overwrite the last copy.
+  if (recoveredDraftPersistenceFailed) state = { ...state, recoveryDrafts: retiredDrafts };
   lastReviewState = state;
   // The artifact reported a card, so its anchor exists: whatever miss was recorded is answered.
   if (state?.card) unrestorableDraftMiss = null;
-  if (!state || (!state.card && !(Array.isArray(state.fields) && state.fields.length))) {
+  if (
+    !state ||
+    (!state.card && !(Array.isArray(state.fields) && state.fields.length) && !state.recoveryDrafts?.length)
+  ) {
+    if (!state?.attachmentsPending) lastReviewState = null;
     try {
       sessionStorage.removeItem(reviewStateStorageKey);
     } catch {
@@ -1113,7 +1249,65 @@ function setReviewState(state) {
 }
 
 function hasUnsentDraft() {
-  return Boolean(lastReviewState && lastReviewState.card && String(lastReviewState.card.text || "").trim());
+  if (editingPromptId) return true;
+  return Boolean(
+    lastReviewState?.attachmentsPending ||
+    lastReviewState?.fields?.some((field) => field.dirty) ||
+    (lastReviewState?.card && String(lastReviewState.card.text || "").trim()),
+  );
+}
+
+let reviewCaptureSequence = 0;
+let pendingReviewCapture = null;
+let reviewSwitchInFlight = false;
+let reviewNavigationPending = false;
+let recoveredDraftPersistenceFailed = Boolean(lastReviewState?.recoveryDrafts?.length);
+function captureLatestReviewState() {
+  if (pendingReviewCapture) return pendingReviewCapture.promise;
+  const requestId = "review-" + ++reviewCaptureSequence;
+  let finish;
+  const promise = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const timer = setTimeout(() => {
+    if (pendingReviewCapture?.id !== requestId) return;
+    pendingReviewCapture = null;
+    postToFrame({ type: "lavish:releaseReviewState" });
+    finish(false);
+  }, 1500);
+  pendingReviewCapture = { id: requestId, finish, timer, promise };
+  postToFrame({ type: "lavish:requestReviewState", request_id: requestId, freeze: true });
+  return promise;
+}
+
+async function reloadArtifactPreservingDraft(explicit = false, options = {}) {
+  if (reviewSwitchInFlight || reviewNavigationPending) return;
+  if (!explicit && hasUnsentDraft()) {
+    setChromeOutdated(true, "draft-revision");
+    return;
+  }
+  reviewSwitchInFlight = true;
+  let navigating = false;
+  try {
+    const captured = await captureLatestReviewState();
+    if (!captured || (!explicit && hasUnsentDraft()) || lastReviewState?.attachmentsPending) {
+      setChromeOutdated(true, "draft-revision");
+      if (lastReviewState?.attachmentsPending && outdatedText) {
+        outdatedText.textContent =
+          "A new revision is available. Queue or remove the attachment draft before switching; your current input is preserved.";
+      }
+      return;
+    }
+    navigating = await resetFrame(options);
+    if (navigating) {
+      reviewNavigationPending = true;
+      setChromeOutdated(false);
+      refreshWhiteboardSource();
+    }
+  } finally {
+    reviewSwitchInFlight = false;
+    if (!navigating) postToFrame({ type: "lavish:releaseReviewState" });
+  }
 }
 
 // The SDK looked for this draft's anchor in a loaded artifact and did not find it. Retiring a
@@ -1143,8 +1337,10 @@ function discardUnrestorableDraft(selector) {
 // It is persisted per session so a reload does not take the last copy with it.
 function loadRetiredDrafts() {
   const stored = loadJsonState(retiredDraftStorageKey, []);
-  if (!Array.isArray(stored)) return [];
-  return stored.filter((entry) => typeof entry === "string" && entry.trim());
+  const fallback = loadJsonState(reviewStateStorageKey, null)?.recoveryDrafts;
+  return [...new Set([...(Array.isArray(stored) ? stored : []), ...(Array.isArray(fallback) ? fallback : [])])].filter(
+    (entry) => typeof entry === "string" && entry.trim(),
+  );
 }
 
 // No entry already handed back is ever dropped to make room for a new one. When browser storage
@@ -1153,7 +1349,10 @@ function loadRetiredDrafts() {
 function keepRetiredDraft(text) {
   if (!text.trim()) return;
   retiredDrafts = [...retiredDrafts, text];
-  renderRetiredDraft(text, saveJsonState(retiredDraftStorageKey, retiredDrafts));
+  const stored = saveJsonState(retiredDraftStorageKey, retiredDrafts);
+  recoveredDraftPersistenceFailed = !stored;
+  renderRetiredDraft(text, stored);
+  return stored;
 }
 
 function renderRetiredDraft(text, stored = true) {
@@ -1161,7 +1360,7 @@ function renderRetiredDraft(text, stored = true) {
   const el = document.createElement("div");
   el.className = "bubble note";
   el.innerHTML =
-    "<small>Unsent annotation</small><div>The element this note was attached to is no longer in the artifact, so Lavish could not reopen the card. Your text is kept here:</div>" +
+    "<small>Unsent annotation</small><div>The artifact removed or replaced what this note was attached to, so Lavish could not keep it open. Your text is kept here:</div>" +
     '<div class="note-draft">' +
     escapeHtml(text) +
     "</div>" +
@@ -1270,6 +1469,7 @@ function sheetSummary() {
   }
   if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true };
   if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false };
+  if (agentPresence === "external") return { text: "External listener active", accent: false, unread: false };
   if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false };
   return { text: "Agent not listening", accent: false, unread: false };
 }
@@ -1419,16 +1619,152 @@ function scrollElementIntoView(el) {
   el.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
+function isPromptEditable(prompt) {
+  return Boolean(prompt) && !terminalSubmission && !isPromptSending(prompt);
+}
+
+function editQueuedPrompt(index, { reveal = true } = {}) {
+  const prompt = queued[index];
+  if (ended || !isPromptEditable(prompt)) return;
+  const id = promptIdentity(prompt);
+  if (!id || id === editingPromptId) return;
+  // Moving to another note keeps what was typed into the first, the way leaving a field does.
+  commitQueuedEdit();
+  editingPromptId = id;
+  editingDraft = String(prompt.prompt || "");
+  editFocusPending = true;
+  if (isMobileSheet()) setSheetOpen(true);
+  render();
+  if (reveal && prompt.selector) postToFrame({ type: "lavish:revealElement", selector: String(prompt.selector) });
+}
+
+function endQueuedEdit() {
+  editingPromptId = "";
+  editingDraft = "";
+}
+
+// Writes the open edit into its note without rendering. Returns whether the queue changed. A note
+// cleared of words and images is removed, as if its remove control had been used.
+function commitQueuedEdit() {
+  if (!editingPromptId) return false;
+  const index = queued.findIndex((prompt) => promptIdentity(prompt) === editingPromptId);
+  const text = editingDraft.trim();
+  endQueuedEdit();
+  const prompt = queued[index];
+  if (!isPromptEditable(prompt)) return false;
+  if (!text && !attachmentCount(prompt)) {
+    queued.splice(index, 1);
+    afterQueuedPromptRemoved();
+  } else {
+    // In place, not replaced: the send bookkeeping tracks notes by object identity.
+    prompt.prompt = text;
+    persistQueuedPrompts();
+  }
+  return true;
+}
+
+function saveQueuedEdit() {
+  commitQueuedEdit();
+  render();
+}
+
+function cancelQueuedEdit() {
+  endQueuedEdit();
+  render();
+}
+
+// A click on an element the artifact knows carries a queued note. The artifact names only the
+// selector, so the most a forged message can do is open one of the user's own notes for editing.
+function editQueuedAnchor(selector) {
+  if (!selector) return;
+  for (let index = queued.length - 1; index >= 0; index--) {
+    if (isElementAnchoredPrompt(queued[index]) && queuedAnchorSelectorsOf(queued[index]).includes(selector)) {
+      if (isPromptEditable(queued[index])) {
+        editQueuedPrompt(index, { reveal: false });
+        return;
+      }
+      break;
+    }
+  }
+  // The note is already on its way, or gone: the click still deserves the card it would have had.
+  postToFrame({ type: "lavish:annotateElement", selector });
+}
+
+// Notes that point at a whole element, cell, or diagram node, which a later click on that same
+// target can find again. A text selection's note is about the words, not the element around them.
+function isElementAnchoredPrompt(prompt) {
+  const kind = promptAnchor(prompt)?.kind;
+  return Boolean(prompt.selector) && (kind === "element" || kind === "cell" || kind === "node");
+}
+
+// A diagram node is one target however deep the click lands, so its note answers to the node's
+// own selector as well as the clicked element's. Other notes name only the exact element.
+function queuedAnchorSelectorsOf(prompt) {
+  const target = prompt.target && typeof prompt.target === "object" ? prompt.target : null;
+  const whole = target?.type === "mermaid-node" ? String(target.selector || "") : "";
+  return whole ? [String(prompt.selector), whole] : [String(prompt.selector)];
+}
+
+// Tells the artifact which element selectors carry a queued note. Only selectors cross into the
+// frame: the artifact is agent-authored, and the note text stays in the chrome.
+function postQueuedAnchors(force = false) {
+  const selectors = [
+    ...new Set(queued.filter((prompt) => isElementAnchoredPrompt(prompt)).flatMap(queuedAnchorSelectorsOf)),
+  ];
+  const signature = JSON.stringify(selectors);
+  if (!force && signature === postedQueuedAnchors) return;
+  postedQueuedAnchors = signature;
+  postToFrame({ type: "lavish:queuedAnchors", selectors });
+}
+
+queuedLog.addEventListener("click", (event) => {
+  const target = /** @type {Element | null} */ (event.target);
+  if (!target || typeof target.closest !== "function") return;
+  // The remove control owns its own click, and an editor's textarea is for typing.
+  if (target.closest(".queued-remove") || target.closest(".queued-edit-input")) return;
+  if (target.closest(".queued-edit-save")) return saveQueuedEdit();
+  if (target.closest(".queued-edit-cancel")) return cancelQueuedEdit();
+  const bubble = /** @type {HTMLElement | null} */ (target.closest(".queued-edit") || target.closest(".bubble.queued"));
+  if (bubble) editQueuedPrompt(Number(bubble.dataset.index));
+});
+queuedLog.addEventListener("input", (event) => {
+  const target = /** @type {HTMLTextAreaElement | null} */ (event.target);
+  if (target && typeof target.closest === "function" && target.closest(".queued-edit-input")) {
+    editingDraft = String(target.value || "");
+  }
+});
+queuedLog.addEventListener("keydown", (event) => {
+  const target = /** @type {Element | null} */ (event.target);
+  if (!target || typeof target.closest !== "function" || !target.closest(".queued-edit-input")) return;
+  // The annotation card's keys: Enter keeps the words, Shift+Enter breaks the line.
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    event.stopPropagation();
+    saveQueuedEdit();
+  } else if (event.key === "Escape" && !event.isComposing) {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelQueuedEdit();
+  }
+});
+
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   if (terminalSubmission || isPromptSending(queued[index])) return;
-  queued.splice(index, 1);
+  const [removed] = queued.splice(index, 1);
+  afterQueuedPromptRemoved();
+  render();
+  // A queued repair reserves its warning IDs. Explicit removal releases them
+  // immediately, without waiting for another server warning event.
+  if (removed?.tag === "layout-warnings") renderWarnings();
+}
+
+function afterQueuedPromptRemoved() {
   persistQueuedPrompts();
   if (!queued.length) {
     clearSendAcknowledgementWarning();
     if (sendFailureOwner?.kind !== "preparation") clearPersistentSendFailure();
   }
-  render();
 }
 
 function promptQueueKey(prompt) {
@@ -1463,6 +1799,13 @@ function enqueuePrompt(rawPrompt, /** @type {FeedbackPreparation | null} */ prep
   if (queueKey) {
     const index = queued.findIndex((item) => promptQueueKey(item) === queueKey);
     if (index !== -1) {
+      // The replacement is the artifact's newer answer. Words typed against the old answer never
+      // move onto it; they are handed back to the reviewer instead.
+      if (editingPromptId && promptIdentity(queued[index]) === editingPromptId) {
+        const draft = editingDraft.trim();
+        endQueuedEdit();
+        if (draft !== String(queued[index].prompt || "").trim()) keepRetiredDraft(draft);
+      }
       queued[index] = prompt;
     } else {
       queued.push(prompt);
@@ -1741,6 +2084,8 @@ function sendQueued(endAfter) {
     return;
   }
   closeMenus();
+  // Send delivers what the panel shows, so an open edit is kept rather than sent stale.
+  if (commitQueuedEdit()) render();
 
   // A pending or failed chip holds back only the COMPOSER message (and an
   // explicit end, which would strand the chips) - queued annotation prompts
@@ -1958,7 +2303,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       showQueuedSendFailure(
-        "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
+        "Could not send because the layout issue selection changed. Your feedback is still queued. Remove only the outdated Layout issue repair message using its × button; keep your annotations and attachments. Then select current issues and choose Queue selected fixes, or send your remaining feedback without that repair request.",
         { kind: "submission", operation: submission },
       );
       if (submission.terminal) releaseTerminalSubmission(submission.terminal);
@@ -2096,7 +2441,7 @@ function setLayoutGateFailure(title, copy, actionLabel = "Reload", onAction, { s
   if (layoutGateAction) {
     layoutGateAction.disabled = false;
     layoutGateAction.textContent = actionLabel;
-    layoutGateAction.onclick = onAction || (() => location.reload());
+    layoutGateAction.onclick = onAction || checkServerThenReload("Lavish is not running.", "Start Lavish and retry.");
   }
   if (layoutGateBypass) {
     layoutGateBypass.hidden = false;
@@ -2127,9 +2472,7 @@ function checkServerThenReload(failureTitle, stillDownCopy) {
     try {
       outcome = await probeChromeHealth();
       if (outcome === "running") {
-        navigating = true;
-        await flushWhiteboardsBeforeChromeReload();
-        location.reload();
+        navigating = await reloadChromePreservingDraft(true);
       }
     } finally {
       // Every path that does not navigate hands the control back, including a probe that timed
@@ -2137,7 +2480,7 @@ function checkServerThenReload(failureTitle, stillDownCopy) {
       if (!navigating) {
         checking = false;
         if (layoutGateAction) layoutGateAction.disabled = false;
-        if (cycle === layoutGateCycle) {
+        if (outcome !== "running" && cycle === layoutGateCycle) {
           const answered = outcome !== "no-answer";
           if (layoutGateTitle) layoutGateTitle.textContent = answered ? failureTitle : HEALTH_NO_ANSWER_TITLE;
           if (layoutGateCopy) layoutGateCopy.textContent = answered ? stillDownCopy : HEALTH_NO_ANSWER_COPY;
@@ -2518,6 +2861,265 @@ function revealWarning(warning) {
   postToFrame({ type: "lavish:revealElement", selector: warning.selector });
 }
 
+// ---------------------------------------------------------------------------
+// Revision legend
+//
+// The agent declares what it changed in the artifact HTML itself (a
+// `data-lavish-revisions` registry plus `data-lavish-revision` marks); the SDK
+// reads it and posts it here. The legend lives entirely in the chrome, so the
+// served artifact still matches the file on disk - Lavish never paints the
+// change indicator into the page. Reveal borrows the same transient marker the
+// layout-issues drawer uses, and only when the reader asks for it.
+
+// The payload crosses postMessage from a sandboxed frame rendering author
+// content, so it is untrusted here whatever built it. These bound what is
+// examined, not what is accepted: capping accepted rows alone would let a
+// registry of ten thousand records walk the whole array on the chrome's main
+// thread before yielding its handful of rows.
+// Server-owned, injected into the session JSON from src/artifact-revisions.js.
+// The swatch is presentation the chrome owes the reader, not something the
+// artifact gets a say in, so nothing about it is read from the message.
+const REVISION_PALETTE = (Array.isArray(sessionData.revisionPalette) ? sessionData.revisionPalette : []).filter(
+  (entry) => entry && /^#[0-9a-fA-F]{6}$/.test(String(entry.hex)),
+);
+const REVISION_LIMITS = {
+  // Derived from the server-injected palette (src/artifact-revisions.js) rather than a
+  // second hardcoded number, so the two can never drift; falls back to 6 only if the
+  // palette itself came through empty.
+  entries: REVISION_PALETTE.length > 0 ? REVISION_PALETTE.length : 6,
+  rawEntries: 256,
+  marks: 200,
+  rawMarks: 2000,
+  id: 60,
+  label: 80,
+  summary: 400,
+  timestamp: 40,
+  excerpt: 120,
+  selector: 400,
+};
+const REVISION_BORDER_STYLES = ["solid", "dashed", "dotted", "double"];
+
+/** @type {any[]} */
+let revisionEntries = [];
+/** @type {any[]} */
+let revisionMarks = [];
+/** @type {Map<string, number>} */
+const revisionRevealCursor = new Map();
+let revisionsDrawerOpen = false;
+
+// Display-only fields. Anything the legend merely shows can be shortened.
+function revisionText(value, max) {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  const text = String(value).trim();
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+// Identity fields, mirroring `exactRevisionText` in src/artifact-revisions.js.
+// The message is untrusted here, so shortening an id or a selector is worse
+// than dropping it: two distinct overlong ids collapse into one legend row, and
+// the first 400 characters of a long selector are a different valid selector
+// that Reveal would resolve to some other block.
+function revisionExact(value, max) {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  const text = String(value).trim();
+  return text.length > 0 && text.length <= max ? text : "";
+}
+
+function revisionPatternFill(pattern) {
+  if (pattern === "diagonal") return "repeating-linear-gradient(45deg, currentColor 0 2px, transparent 2px 5px)";
+  if (pattern === "dots") return "radial-gradient(currentColor 1px, transparent 1px)";
+  return "";
+}
+
+// The swatch for a revision's position in the registry. Position is the only
+// thing the artifact influences, and it cannot repeat one: ids are deduplicated
+// before this runs, so each accepted revision gets a distinct index and
+// therefore a distinct swatch.
+function revisionPresentation(index) {
+  const entry = REVISION_PALETTE.length > 0 ? REVISION_PALETTE[index % REVISION_PALETTE.length] : null;
+  return {
+    color: entry ? String(entry.hex) : "#0072b2",
+    borderStyle: REVISION_BORDER_STYLES.includes(String(entry && entry.borderStyle))
+      ? String(entry.borderStyle)
+      : "solid",
+    pattern: revisionPatternFill(entry && entry.pattern),
+  };
+}
+
+// Only text crosses from the artifact into the legend, and it crosses as
+// textContent. Nothing the message carries reaches a style property.
+function normalizeRevisionMessage(msg) {
+  const rawRevisions = Array.isArray(msg && msg.revisions) ? msg.revisions : [];
+  const revisions = [];
+  const byId = new Map();
+  let examined = 0;
+  for (const raw of rawRevisions) {
+    if (examined >= REVISION_LIMITS.rawEntries || revisions.length >= REVISION_LIMITS.entries) break;
+    examined += 1;
+    if (!raw || typeof raw !== "object") continue;
+    const id = revisionExact(raw.id, REVISION_LIMITS.id);
+    if (!id || /\s/.test(id) || byId.has(id)) continue;
+    const entry = {
+      id,
+      label: revisionText(raw.label, REVISION_LIMITS.label) || id,
+      timestamp: revisionText(raw.timestamp, REVISION_LIMITS.timestamp),
+      summary: revisionText(raw.summary, REVISION_LIMITS.summary),
+      ...revisionPresentation(revisions.length),
+      marks: [],
+    };
+    byId.set(id, entry);
+    revisions.push(entry);
+  }
+
+  const rawMarks = Array.isArray(msg && msg.marks) ? msg.marks : [];
+  const marks = [];
+  examined = 0;
+  for (const raw of rawMarks) {
+    if (examined >= REVISION_LIMITS.rawMarks || marks.length >= REVISION_LIMITS.marks) break;
+    examined += 1;
+    if (!raw || typeof raw !== "object") continue;
+    const revisionId = revisionExact(raw.revision_id, REVISION_LIMITS.id);
+    const selector = revisionExact(raw.selector, REVISION_LIMITS.selector);
+    const owner = byId.get(revisionId);
+    if (!owner || !selector) continue;
+    const mark = {
+      revisionId,
+      selector,
+      tag: revisionText(raw.tag, 40).toLowerCase(),
+      excerpt: revisionText(raw.excerpt, REVISION_LIMITS.excerpt),
+    };
+    owner.marks.push(mark);
+    marks.push(mark);
+  }
+
+  return { revisions, marks };
+}
+
+function resetRevisionLegend() {
+  revisionEntries = [];
+  revisionMarks = [];
+  revisionRevealCursor.clear();
+  renderRevisionLegend();
+}
+
+function applyRevisionMessage(msg) {
+  const normalized = normalizeRevisionMessage(msg);
+  revisionEntries = normalized.revisions;
+  revisionMarks = normalized.marks;
+  for (const id of [...revisionRevealCursor.keys()]) {
+    if (!revisionEntries.some((entry) => entry.id === id)) revisionRevealCursor.delete(id);
+  }
+  renderRevisionLegend();
+}
+
+function revisionMarkSummary(entry) {
+  if (entry.marks.length === 0) return "no marked blocks";
+  return entry.marks.length === 1 ? "1 marked block" : entry.marks.length + " marked blocks";
+}
+
+function buildRevisionRow(entry) {
+  const row = document.createElement("div");
+  row.className = "revision-row";
+
+  const swatch = document.createElement("span");
+  swatch.className = "revision-swatch";
+  swatch.setAttribute("aria-hidden", "true");
+  swatch.style.color = entry.color;
+  swatch.style.borderColor = entry.color;
+  swatch.style.borderStyle = entry.borderStyle;
+  if (entry.pattern) swatch.style.backgroundImage = entry.pattern;
+  row.appendChild(swatch);
+
+  const body = document.createElement("div");
+  body.className = "revision-body";
+
+  const head = document.createElement("div");
+  head.className = "revision-head";
+  const label = document.createElement("span");
+  label.className = "revision-label";
+  label.textContent = entry.label;
+  head.appendChild(label);
+  if (entry.timestamp) {
+    const time = document.createElement("span");
+    time.className = "revision-time";
+    time.textContent = entry.timestamp;
+    head.appendChild(time);
+  }
+  body.appendChild(head);
+
+  if (entry.summary) {
+    const summary = document.createElement("p");
+    summary.className = "revision-summary";
+    summary.textContent = entry.summary;
+    body.appendChild(summary);
+  }
+
+  const foot = document.createElement("div");
+  foot.className = "revision-foot";
+  const count = document.createElement("span");
+  count.className = "revision-marks";
+  count.textContent = revisionMarkSummary(entry);
+  foot.appendChild(count);
+  if (entry.marks.length > 0) {
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "revision-reveal";
+    const position = (revisionRevealCursor.get(entry.id) || 0) % entry.marks.length;
+    reveal.textContent = entry.marks.length === 1 ? "Reveal" : "Reveal " + (position + 1) + "/" + entry.marks.length;
+    reveal.setAttribute("aria-label", "Reveal the next block changed in " + entry.label);
+    // Bound per row rather than delegated from the list: the rows are rebuilt
+    // on every render anyway, so there is no listener to accumulate, and the
+    // button carries the revision it belongs to without a data attribute round
+    // trip through the DOM.
+    reveal.onclick = () => revealNextRevisionMark(entry.id);
+    foot.appendChild(reveal);
+  }
+  body.appendChild(foot);
+
+  row.appendChild(body);
+  return row;
+}
+
+function renderRevisionLegend() {
+  if (!revisionsWrap) return;
+  const count = revisionEntries.length;
+  revisionsWrap.hidden = count === 0 || ended;
+  if (revisionsWrap.hidden && revisionsDrawerOpen) setRevisionsDrawerOpen(false);
+  revisionsCount.textContent = String(count);
+  revisionsButton.setAttribute("aria-label", count === 1 ? "1 revision" : count + " revisions");
+  revisionsSummary.textContent =
+    (count === 1 ? "1 revision" : count + " revisions") +
+    " · " +
+    (revisionMarks.length === 1 ? "1 marked block" : revisionMarks.length + " marked blocks");
+
+  revisionsList.replaceChildren(...revisionEntries.map(buildRevisionRow));
+}
+
+function setRevisionsDrawerOpen(open) {
+  revisionsDrawerOpen = open && !ended;
+  revisionsDrawer.hidden = !revisionsDrawerOpen;
+  revisionsButton.setAttribute("aria-expanded", String(revisionsDrawerOpen));
+  if (revisionsDrawerOpen) closeMenus();
+}
+
+function closeRevisionsDrawer({ restoreFocus = false } = {}) {
+  if (!revisionsDrawerOpen) return;
+  setRevisionsDrawerOpen(false);
+  if (restoreFocus) revisionsButton.focus();
+}
+
+// Step through a revision's marked blocks one at a time. The existing reveal
+// path flashes one element and clears the previous marker, so a revision that
+// touched several blocks is walked rather than lit up all at once.
+function revealNextRevisionMark(id) {
+  const entry = revisionEntries.find((candidate) => candidate.id === id);
+  if (!entry || entry.marks.length === 0) return;
+  const position = (revisionRevealCursor.get(id) || 0) % entry.marks.length;
+  postToFrame({ type: "lavish:revealElement", selector: entry.marks[position].selector });
+  revisionRevealCursor.set(id, (position + 1) % entry.marks.length);
+  renderRevisionLegend();
+}
+
 async function dismissWarning(id) {
   try {
     const response = await fetch("/api/" + key + "/layout-warnings/dismiss", {
@@ -2617,6 +3219,8 @@ function markSessionEnded() {
   closeShareDialog();
   closeWarningsDrawer();
   renderWarnings();
+  closeRevisionsDrawer();
+  renderRevisionLegend();
   closeWhiteboard();
   annotationSwitch.disabled = true;
   moreButton.disabled = true;
@@ -2681,6 +3285,43 @@ function copyFilePath() {
     copyHint.classList.remove("copied");
     copyHintText.textContent = "Copy";
   }, 1600);
+}
+
+function setAccessCopyFeedback(hint, hintText, success) {
+  if (!hint) return;
+  const status = document.getElementById("accessCopyStatus");
+  const label = hint === copyLocalAccessHint ? "Local" : "Remote";
+  if (status)
+    status.textContent = success
+      ? `${label}-Adresse kopiert ✓`
+      : `${label}: Kopieren fehlgeschlagen. Adresse auswählen und manuell kopieren.`;
+  clearTimeout(hint._accessTimer);
+  if (success) {
+    hint.classList.remove("copy-error");
+    hint.classList.add("copied");
+    if (hintText) hintText.textContent = "Copied";
+  } else {
+    hint.classList.remove("copied");
+    hint.classList.add("copy-error");
+    if (hintText) hintText.textContent = "Error";
+  }
+  hint._accessTimer = setTimeout(() => {
+    hint.classList.remove("copied", "copy-error");
+    if (hintText) hintText.textContent = "Copy";
+  }, 2000);
+}
+
+async function copyLocalAccess() {
+  const url =
+    localAccessUrl ||
+    (typeof location !== "undefined" ? `${location.origin}/session/${encodeURIComponent(key)}?annotate=off` : "");
+  const success = await copyText(url);
+  setAccessCopyFeedback(copyLocalAccessHint, copyLocalAccessHintText, success);
+}
+
+async function copyRemoteAccess() {
+  const success = await copyText(remoteAccessUrl);
+  setAccessCopyFeedback(copyRemoteAccessHint, copyRemoteAccessHintText, success);
 }
 
 function copyDomSnapshot() {
@@ -2946,7 +3587,10 @@ function scheduleArtifactLoadRecovery() {
   artifactLoadRecoveryTimer = setTimeout(() => {
     artifactLoadRecoveryTimer = undefined;
     if (ended || sequence !== artifactLoadRequestSequence) return;
-    replaceArtifactFrame({ recoveryRetry: true }).catch(() => {});
+    const retry = artifactLoadToken
+      ? reloadArtifactPreservingDraft(false, { recoveryRetry: true })
+      : replaceArtifactFrame({ recoveryRetry: true });
+    retry.catch(() => {});
   }, delay);
   artifactLoadRecoveryTimer?.unref?.();
   return true;
@@ -2962,6 +3606,11 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   clearTimeout(artifactSilenceTimer);
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
   if (!artifactSrc) {
+    // The next document reports its own registry once it loads; until then the
+    // previous revision's legend would point at blocks that may no longer exist.
+    // Only clear it here, right before the frame is actually replaced - a preserved
+    // load (superseded/out-of-order/exhausted retries below) must leave it intact.
+    resetRevisionLegend();
     startLayoutGateCycle();
     const currentSrc = frame.src || "about:blank";
     frame.src = currentSrc + (currentSrc.includes("?") ? "&" : "?") + "lavish_reload=" + Date.now();
@@ -2982,9 +3631,9 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
     return false;
   };
   // Keep whatever is on screen, then try again later. A begin-load can fail for reasons that
-  // clear on their own - the shared server is mid-restart, or its handoff map was reset by that
-  // restart and this chrome's one re-handshake landed in the same outage window. Giving up here
-  // is what leaves the review permanently unloaded.
+  // clear on their own - the shared server is mid-restart, or a handoff no begin-load had yet
+  // persisted was lost with that restart and this chrome's one re-handshake landed in the same
+  // outage window. Giving up here is what leaves the review permanently unloaded.
   const recoverLater = () => {
     preservePreviousLoad();
     if (requestSequence !== artifactLoadRequestSequence || ended) return false;
@@ -3047,6 +3696,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
               "This review is already open in another tab.",
               "Lavish loads an artifact in one tab at a time. Take over here to move the review into this tab, or switch back to the tab that already has it.",
               "Take over here",
+              () => location.reload(),
             );
           }
           return preservePreviousLoad();
@@ -3078,22 +3728,25 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   inlineWhiteboardChannels.clear();
   setHandoffSuperseded(false);
   startLayoutGateCycle();
+  // The next document reports its own registry once it loads; until then the
+  // previous revision's legend would point at blocks that may no longer exist.
+  resetRevisionLegend();
   frame.src = artifactFrameSrcForLoad({ revision, token });
   return true;
 }
 
-function resetFrame() {
+function resetFrame(options = {}) {
   if (artifactResetPromise) return artifactResetPromise;
   const hasLiveInlineWhiteboard = [...inlineWhiteboardChannels].some(
     ([index, channel]) => channel.initialized && index !== overlayIndex,
   );
   if (!hasLiveInlineWhiteboard) {
-    return replaceArtifactFrame();
+    return replaceArtifactFrame(options);
   }
   artifactResetPromise = flushInlineWhiteboards()
     .then((flushed) => {
       if (!flushed) return false;
-      return replaceArtifactFrame();
+      return replaceArtifactFrame(options);
     })
     .finally(() => {
       artifactResetPromise = null;
@@ -3612,9 +4265,38 @@ function loadFrame() {
 
 function reloadArtifact() {
   closeMenus();
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
-  });
+  return reloadArtifactPreservingDraft(true);
+}
+
+async function reloadChromePreservingDraft(explicit, reason = "") {
+  if (reviewSwitchInFlight || reviewNavigationPending) return false;
+  reviewSwitchInFlight = true;
+  let navigating = false;
+  try {
+    const captured = !artifactSrc || (await captureLatestReviewState());
+    const persisted = !lastReviewState || saveJsonState(reviewStateStorageKey, lastReviewState);
+    if (
+      !captured ||
+      !persisted ||
+      recoveredDraftPersistenceFailed ||
+      lastReviewState?.attachmentsPending ||
+      (!explicit && hasUnsentDraft())
+    ) {
+      setChromeOutdated(true, reason);
+      if (lastReviewState?.attachmentsPending && outdatedText) {
+        outdatedText.textContent =
+          "Queue or remove the attachment draft before reloading; your current input is preserved.";
+      }
+      return false;
+    }
+    await flushWhiteboardsBeforeChromeReload();
+    navigating = true;
+    location.reload();
+    return true;
+  } finally {
+    if (!navigating) reviewSwitchInFlight = false;
+    if (!navigating) postToFrame({ type: "lavish:releaseReviewState" });
+  }
 }
 
 async function reloadAfterServerRestart(reason) {
@@ -3700,14 +4382,17 @@ async function reloadChromeAfterServerRestart(reason = "") {
     return;
   }
 
-  await flushWhiteboardsBeforeChromeReload();
-  location.reload();
+  if (!(await reloadChromePreservingDraft(false, reason))) chromeRestartReloadPromise = null;
 }
 
 // The banner is shown at the moment a server goes away, and in the deliberate-stop case nothing
 // is coming to replace it, so this button probes before it navigates for the same reason the
 // not-running card does: a reload into a dead port lands on the browser's own error page.
 async function reloadChromeForOutdatedBanner() {
+  if (chromeOutdatedReason === "draft-revision") {
+    await reloadArtifactPreservingDraft(true);
+    return;
+  }
   if (outdatedReloadInFlight) return;
   outdatedReloadInFlight = true;
   if (outdatedReloadButton) outdatedReloadButton.disabled = true;
@@ -3718,15 +4403,13 @@ async function reloadChromeForOutdatedBanner() {
   try {
     outcome = await probeChromeHealth();
     if (outcome === "running") {
-      navigating = true;
-      await flushWhiteboardsBeforeChromeReload();
-      location.reload();
+      navigating = await reloadChromePreservingDraft(true, chromeOutdatedReason);
     }
   } finally {
     if (!navigating) {
       outdatedReloadInFlight = false;
       if (outdatedReloadButton) outdatedReloadButton.disabled = false;
-      if (outdatedText && generation === chromeOutdatedGeneration) {
+      if (outcome !== "running" && outdatedText && generation === chromeOutdatedGeneration) {
         outdatedText.textContent =
           outcome === "no-answer"
             ? HEALTH_NO_ANSWER_COPY
@@ -3736,10 +4419,25 @@ async function reloadChromeForOutdatedBanner() {
   }
 }
 
+function persistArtifactLinkHost(mode) {
+  if (mode !== "localhost" && mode !== "tailscale") return;
+  if (location.pathname !== `/session/${encodeURIComponent(key)}`) return;
+  const params = new URLSearchParams(location.search);
+  if (params.get("link_host") === mode) return;
+  params.set("link_host", mode);
+  globalThis.history.replaceState(globalThis.history.state, "", `${location.pathname}?${params}${location.hash || ""}`);
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
 
   const msg = event.data || {};
+  // The artifact has an opaque origin. Keep this two-value preference on the
+  // chrome URL so its referrer restores the choice after reload and navigation.
+  if (msg.type === "lavish:setLinkHost") {
+    persistArtifactLinkHost(msg.mode);
+    return;
+  }
   const messageToken = String(msg.artifact_load_token || "");
   if (messageToken !== artifactLoadToken) {
     // A pass can be stamped by the load that just lost a token race. Ask the current artifact
@@ -3748,6 +4446,8 @@ window.addEventListener("message", (event) => {
     return;
   }
   const messageSequence = ++artifactMessageSequence;
+  // The replacement SDK's token proves navigation has reached its document.
+  reviewNavigationPending = false;
   artifactSpokeToken = messageToken;
   clearTimeout(artifactSilenceTimer);
   if (msg.type === "lavish:layoutDiagnostics") {
@@ -3793,7 +4493,10 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "lavish:queuePrompt") {
-    enqueuePrompt(msg.prompt);
+    const accepted = enqueuePrompt(msg.prompt);
+    if (typeof msg.review_request_id === "string" && msg.review_request_id) {
+      postToFrame({ type: "lavish:questionQueued", review_request_id: msg.review_request_id, accepted });
+    }
     // Queued from inside the artifact, where the closed dock is the only sign it landed.
     pulseSheetDock();
   }
@@ -3804,7 +4507,34 @@ window.addEventListener("message", (event) => {
     lastScroll = { x: Number(msg.x) || 0, y: Number(msg.y) || 0 };
   }
   if (msg.type === "lavish:reviewState") {
+    const previousMiss = unrestorableDraftMiss;
     setReviewState(msg.state && typeof msg.state === "object" ? msg.state : null);
+    if (pendingReviewCapture && msg.request_id === pendingReviewCapture.id) {
+      // Capturing before a switch is not a successful restoration of an anchor.
+      unrestorableDraftMiss = previousMiss;
+      const capture = pendingReviewCapture;
+      pendingReviewCapture = null;
+      clearTimeout(capture.timer);
+      capture.finish(true);
+    }
+  }
+  if (msg.type === "lavish:reviewDraftRecovered") {
+    const text = String(msg.text || "");
+    if (text.trim()) {
+      const stored = retiredDrafts.includes(text)
+        ? saveJsonState(retiredDraftStorageKey, retiredDrafts)
+        : keepRetiredDraft(text);
+      recoveredDraftPersistenceFailed = !stored;
+      if (!stored) setReviewState(lastReviewState);
+      if (stored && lastReviewState) {
+        const matches = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        setReviewState({
+          ...lastReviewState,
+          fields: (lastReviewState.fields || []).filter((field) => !matches(field, msg.field)),
+          card: matches(lastReviewState.card, msg.card) ? null : lastReviewState.card,
+        });
+      }
+    }
   }
   if (msg.type === "lavish:reviewDraftUnrestorable") {
     discardUnrestorableDraft(String(msg.selector || ""));
@@ -3821,7 +4551,183 @@ window.addEventListener("message", (event) => {
   // chrome cannot see every live reference, so reclamation is the sweeper's job.
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
+  if (msg.type === "lavish:revisions") applyRevisionMessage(msg);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
+  if (msg.type === "lavish:editQueuedAnchor") editQueuedAnchor(String(msg.selector || ""));
+  if (msg.type === "lavish:documentMeta") handleDocumentMeta(msg);
+  if (msg.type === "lavish:copyUrl") handleFrameCopyUrl(msg);
+});
+
+async function handleFrameCopyUrl(msg) {
+  if (String(msg.artifact_load_token || "") !== artifactLoadToken) return;
+  const url = typeof msg.url === "string" ? msg.url : "";
+  const requestId = Number(msg.requestId);
+  if (!Number.isSafeInteger(requestId) || requestId <= 0) return;
+  const source = frame.contentWindow;
+  const token = artifactLoadToken;
+  const allowed = Boolean(url && (url === localAccessUrl || url === remoteAccessUrl));
+  const active = navigator.userActivation?.isActive === true;
+  const success = allowed && active ? await copyText(url) : false;
+  if (source && source === frame.contentWindow && token === artifactLoadToken) {
+    source.postMessage(
+      {
+        type: "lavish:copyUrlResult",
+        requestId,
+        success: Boolean(success),
+        url,
+      },
+      "*",
+    );
+  }
+}
+
+let lastFaviconSource = "";
+
+function handleDocumentMeta(msg) {
+  postToFrame({ type: "lavish:accessUrls", localUrl: localAccessUrl, remoteUrl: remoteAccessUrl });
+  if (!customTitle && msg.title && typeof msg.title === "string") {
+    const cleanTitle = msg.title.trim();
+    if (cleanTitle) {
+      const suffix = " · Lavish";
+      const targetTitle = cleanTitle.endsWith(suffix) ? cleanTitle : `${cleanTitle}${suffix}`;
+      if (document.title !== targetTitle) {
+        document.title = targetTitle;
+      }
+    }
+  }
+
+  if (msg.faviconHref && typeof msg.faviconHref === "string" && msg.faviconHref !== lastFaviconSource) {
+    lastFaviconSource = msg.faviconHref;
+    compositeAndSetFavicon(msg.faviconHref);
+  }
+}
+
+function compositeAndSetFavicon(iconHref) {
+  if (!iconHref) return;
+  const img = new window.Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = 64;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      // 1. Draw base icon
+      ctx.drawImage(img, 0, 0, 64, 64);
+
+      // 2. Draw Lavish badge in bottom-right corner
+      ctx.save();
+      ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
+      ctx.shadowBlur = 4;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 1.5;
+
+      // Dark circle background
+      ctx.beginPath();
+      ctx.arc(47, 47, 15.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#0f172a";
+      ctx.fill();
+
+      // Border ring (cyan)
+      ctx.shadowColor = "transparent";
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = "#38bdf8";
+      ctx.stroke();
+
+      // 3. Draw faceted Lavish Diamond
+      const drawPoly = (points, fill) => {
+        ctx.beginPath();
+        ctx.moveTo(points[0][0], points[0][1]);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i][0], points[i][1]);
+        }
+        ctx.closePath();
+        ctx.fillStyle = fill;
+        ctx.fill();
+      };
+
+      drawPoly(
+        [
+          [43, 38],
+          [51, 38],
+          [49, 44],
+          [45, 44],
+        ],
+        "#e0f2fe",
+      );
+      drawPoly(
+        [
+          [43, 38],
+          [45, 44],
+          [38, 44],
+        ],
+        "#7dd3fc",
+      );
+      drawPoly(
+        [
+          [51, 38],
+          [56, 44],
+          [49, 44],
+        ],
+        "#38bdf8",
+      );
+      drawPoly(
+        [
+          [38, 44],
+          [45, 44],
+          [47, 56],
+        ],
+        "#0284c7",
+      );
+      drawPoly(
+        [
+          [45, 44],
+          [49, 44],
+          [47, 56],
+        ],
+        "#38bdf8",
+      );
+      drawPoly(
+        [
+          [49, 44],
+          [56, 44],
+          [47, 56],
+        ],
+        "#0369a1",
+      );
+      ctx.restore();
+
+      const dataUrl = canvas.toDataURL("image/png");
+      setFaviconLink(dataUrl, "image/png");
+    } catch {
+      // Ignore canvas draw failure
+    }
+  };
+  img.src = iconHref;
+}
+
+function setFaviconLink(href, type = "") {
+  let link = /** @type {HTMLLinkElement | null} */ (document.querySelector("link[rel~='icon']"));
+  if (!link) {
+    link = document.createElement("link");
+    link.rel = "icon";
+    document.head.appendChild(link);
+  }
+  if (type) link.type = type;
+  link.href = href;
+}
+
+frame.addEventListener("load", () => {
+  reviewNavigationPending = false;
+  try {
+    if (!customTitle && frame.contentDocument?.title) {
+      handleDocumentMeta({ title: frame.contentDocument.title });
+    }
+  } catch {
+    // Ignore cross-origin frame read error
+  }
 });
 
 // The sandboxed artifact iframe can't reach the loopback server (opaque origin),
@@ -3964,10 +4870,15 @@ sendButton.onclick = () => sendQueued(false);
 sendAndEndButton.onclick = () => sendQueued(true);
 moreButton.onclick = () => {
   closeWarningsDrawer();
+  closeRevisionsDrawer();
   toggleMenu(moreButton, moreMenu);
   if (moreMenu && !moreMenu.hidden) refreshVersionList();
 };
 warningsButton.onclick = toggleWarningsDrawer;
+revisionsButton.onclick = () => {
+  closeWarningsDrawer();
+  setRevisionsDrawerOpen(revisionsDrawer.hidden);
+};
 warningsSelectAll.onchange = toggleSelectAllWarnings;
 warningsQueueButton.onclick = queueSelectedWarningFixes;
 chatAttachButton.onclick = () => chatAttachInput.click();
@@ -4061,6 +4972,8 @@ chatInput.addEventListener("keydown", (event) => {
 chatInput.addEventListener("input", () => hideSendHint());
 copyPathButton.onclick = copyFilePath;
 if (copySourceMarkdownPathButton) copySourceMarkdownPathButton.onclick = copySourceMarkdownPath;
+if (copyLocalAccessButton) copyLocalAccessButton.onclick = copyLocalAccess;
+if (copyRemoteAccessButton) copyRemoteAccessButton.onclick = copyRemoteAccess;
 if (exportSourceMarkdownButton) exportSourceMarkdownButton.onclick = exportSourceMarkdown;
 reloadArtifactButton.onclick = reloadArtifact;
 if (historyLiveButton) {
@@ -4112,17 +5025,32 @@ endButton.onclick = () => {
 };
 handoffTakeoverButton.onclick = () => location.reload();
 if (outdatedReloadButton) outdatedReloadButton.onclick = () => reloadChromeForOutdatedBanner();
-if (outdatedDismissButton) outdatedDismissButton.onclick = () => setChromeOutdated(false);
+if (outdatedDismissButton) {
+  outdatedDismissButton.onclick = () => {
+    // A dismissed unreachable banner stays dismissed until the stream actually recovers; without
+    // this the next failed reconnect puts it straight back on screen.
+    if (unreachableBannerOwned) {
+      unreachableBannerOwned = false;
+      unreachableDismissed = true;
+    }
+    setChromeOutdated(false);
+  };
+}
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
   if (warningsDrawerOpen && !warningsWrap.contains(target)) closeWarningsDrawer();
+  if (revisionsDrawerOpen && !revisionsWrap.contains(target)) closeRevisionsDrawer();
 });
 // A non-modal popover closes when focus leaves it, so keyboard users are never stranded inside a
 // panel they cannot see the end of.
 warningsWrap.addEventListener("focusout", (event) => {
   const next = /** @type {Node | null} */ (event.relatedTarget);
   if (warningsDrawerOpen && next && !warningsWrap.contains(next)) closeWarningsDrawer();
+});
+revisionsWrap.addEventListener("focusout", (event) => {
+  const next = /** @type {Node | null} */ (event.relatedTarget);
+  if (revisionsDrawerOpen && next && !revisionsWrap.contains(next)) closeRevisionsDrawer();
 });
 whiteboardCloseButton.onclick = closeWhiteboard;
 document.addEventListener("keydown", (event) => {
@@ -4131,6 +5059,8 @@ document.addEventListener("keydown", (event) => {
       closeWhiteboard();
     } else if (!shareDialog.hidden) {
       closeShareDialog();
+    } else if (revisionsDrawerOpen) {
+      closeRevisionsDrawer({ restoreFocus: true });
     } else if (warningsDrawerOpen) {
       closeWarningsDrawer({ restoreFocus: true });
     } else if (!moreMenu.hidden) {
@@ -4159,6 +5089,7 @@ frame.addEventListener("load", () => {
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+  postQueuedAnchors(true);
   if (overlayIndex !== null) {
     inlineWhiteboardChannels.delete(overlayIndex);
     postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex });
@@ -4175,6 +5106,12 @@ function connectLiveEvents() {
   const socket = new WebSocket(protocol + "//" + location.host + "/events/" + encodeURIComponent(key));
   socket.addEventListener("open", () => {
     eventReconnectDelayMs = 500;
+    liveEventFailures = 0;
+    unreachableDismissed = false;
+    if (unreachableBannerOwned) {
+      unreachableBannerOwned = false;
+      setChromeOutdated(false);
+    }
     refreshLayoutWarnings();
   });
   socket.addEventListener("message", (message) => {
@@ -4186,15 +5123,25 @@ function connectLiveEvents() {
     }
   });
   socket.addEventListener("close", () => {
+    liveEventFailures += 1;
+    noteLiveEventsUnreachable();
     setTimeout(connectLiveEvents, eventReconnectDelayMs);
     eventReconnectDelayMs = Math.min(eventReconnectDelayMs * 2, 5000);
   });
 }
 
+// Raise the existing banner once the stream has been down long enough to mean it, and never
+// against an ended session or a banner someone else owns. Reconnecting retires it.
+function noteLiveEventsUnreachable() {
+  if (liveEventFailures < LIVE_EVENT_UNREACHABLE_FAILURES) return;
+  if (ended || unreachableDismissed || unreachableBannerOwned) return;
+  if (outdatedBanner && !outdatedBanner.hidden) return;
+  unreachableBannerOwned = true;
+  setChromeOutdated(true, "");
+}
+
 events.set("reload", () => {
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
-  });
+  reloadArtifactPreservingDraft().catch(() => setChromeOutdated(true, "draft-revision"));
 });
 events.set("chrome-reload", (data) => reloadAfterServerRestart(String(data.reason || "")));
 // The replacement server serves a different artifact's review. This page keeps working against
@@ -4214,7 +5161,7 @@ events.set("chat-sync", (data) => {
   rememberChatAckIds(data.ack_ids);
   syncChat(data.chat || [], data.chat_revision);
 });
-events.set("agent-presence", (data) => setAgentPresence(data.state));
+events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
 connectLiveEvents();
