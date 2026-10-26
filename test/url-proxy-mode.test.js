@@ -67,11 +67,23 @@ test("transformProxyHtml injects base tag, bootstrap script, and Lavish SDK", ()
   assert.match(transformed, /window\.localStorage/);
   assert.match(transformed, /window\.fetch/);
   assert.match(transformed, /XMLHttpRequest\.prototype\.open/);
+  assert.match(transformed, /var targetPath = "\/setup";/);
+  assert.match(transformed, /window\.history\.replaceState\(window\.history\.state, "", targetPath\)/);
   assert.match(transformed, /history\.pushState/);
   assert.match(
     transformed,
     /<script src="\/sdk\.js\?key=key123&artifact_revision=1&artifact_load_token=tok-1"><\/script><\/body>/,
   );
+});
+
+test("transformProxyHtml strips upstream Content-Security-Policy and X-Frame-Options meta tags", () => {
+  const inputHtml = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https:;"><meta content="DENY" http-equiv="X-Frame-Options"><title>App</title></head><body><h1>Content</h1></body></html>`;
+  const transformed = transformProxyHtml(inputHtml, "key123", "http://127.0.0.1:8000/setup", 1, "tok-1");
+
+  assert.doesNotMatch(transformed, /content-security-policy/i);
+  assert.doesNotMatch(transformed, /x-frame-options/i);
+  assert.match(transformed, /<meta charset="utf-8">/);
+  assert.match(transformed, /<title>App<\/title>/);
 });
 
 test("Lavish server URL proxy mode: end-to-end session, iframe sandbox, index proxy, and API forwarding", async () => {
@@ -221,6 +233,22 @@ test("Lavish server URL proxy mode: end-to-end session, iframe sandbox, index pr
     assert.equal(fallbackRes.status, 302);
     assert.equal(fallbackRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
 
+    // 8b. Test root-relative subresource redirection via Referer (ES modules / Vite / SPA assets)
+    const refererRes = await fetch(`${lavishBase}/assets/style.css`, {
+      headers: { referer: `${lavishBase}/artifact/${key}/proxy/setup` },
+      redirect: "manual",
+    });
+    assert.equal(refererRes.status, 307);
+    assert.equal(refererRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
+
+    // 8c. Test root-relative subresource redirection via Cookie fallback
+    const cookieRes = await fetch(`${lavishBase}/assets/style.css`, {
+      headers: { cookie: `lavish_proxy_session=${key}` },
+      redirect: "manual",
+    });
+    assert.equal(cookieRes.status, 307);
+    assert.equal(cookieRes.headers.get("location"), `/artifact/${key}/proxy/assets/style.css`);
+
     // 9. Close target server to simulate upstream crash/outage
     await new Promise((resolve) => targetServer.close(resolve));
 
@@ -253,4 +281,214 @@ test("openCommand rejects recursive self-wrapping of Lavish session URLs", async
       return true;
     },
   );
+});
+
+test("Lavish session custom title persistence and chrome rendering", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-title-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  let lavish;
+  try {
+    lavish = await serve({ port: 0, stateFile: stateFilePath, version: "0.1.70" });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+
+    // 1. Open session with custom title
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: "http://127.0.0.1:9999/app/audits/123",
+        title: "Kundenfläche Stage 2a Reparatur",
+      }),
+    });
+    assert.equal(openRes.status, 200);
+    const openData = await openRes.json();
+    assert.equal(openData.custom_title, "Kundenfläche Stage 2a Reparatur");
+
+    // 2. Fetch chrome HTML and verify <title> and customTitle in session JSON
+    const sessionRes = await fetch(`${lavishBase}/session/${openData.key}`);
+    assert.equal(sessionRes.status, 200);
+    const sessionHtml = await sessionRes.text();
+    assert.match(sessionHtml, /<title>Kundenfläche Stage 2a Reparatur · Lavish<\/title>/);
+    assert.match(sessionHtml, /"customTitle":"Kundenfläche Stage 2a Reparatur"/);
+
+    // 3. Verify query parameter ?title= overrides title on the fly
+    const overrideRes = await fetch(`${lavishBase}/session/${openData.key}?title=Adhoc+Title`);
+    assert.equal(overrideRes.status, 200);
+    const overrideHtml = await overrideRes.text();
+    assert.match(overrideHtml, /<title>Adhoc Title · Lavish<\/title>/);
+    assert.match(overrideHtml, /"customTitle":"Adhoc Title"/);
+  } finally {
+    if (lavish) await lavish.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("normalizeArgv and replyCommand accept HTTP(S) URLs and reuse-only rejects lifecycle commands", async () => {
+  const { normalizeArgv, replyCommand, serverCommand, setupCommand, stopCommand } = await import("../src/cli.js");
+
+  assert.deepEqual(normalizeArgv(["--title", "Audit", "https://example.com/app"]), [
+    "open",
+    "--title",
+    "Audit",
+    "https://example.com/app",
+  ]);
+  assert.deepEqual(normalizeArgv(["--no-open", "http://127.0.0.1:8000/setup"]), [
+    "open",
+    "--no-open",
+    "http://127.0.0.1:8000/setup",
+  ]);
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-url-reply-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  let lavish;
+  const previousEnv = {
+    LAVISH_AXI_PORT: process.env.LAVISH_AXI_PORT,
+    LAVISH_AXI_HOST: process.env.LAVISH_AXI_HOST,
+    LAVISH_AXI_STATE_DIR: process.env.LAVISH_AXI_STATE_DIR,
+    LAVISH_AXI_REUSE_ONLY: process.env.LAVISH_AXI_REUSE_ONLY,
+  };
+  try {
+    const pkg = JSON.parse(
+      await (await import("node:fs/promises")).readFile(new URL("../package.json", import.meta.url), "utf8"),
+    );
+    lavish = await serve({ port: 0, stateFile: stateFilePath, version: pkg.version });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+    const targetUrl = "http://127.0.0.1:9998/app/setup";
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: targetUrl }),
+    });
+    assert.equal(openRes.status, 200);
+
+    process.env.LAVISH_AXI_PORT = String(lavish.port);
+    process.env.LAVISH_AXI_HOST = "127.0.0.1";
+    process.env.LAVISH_AXI_STATE_DIR = tempDir;
+    process.env.LAVISH_AXI_REUSE_ONLY = "1";
+
+    const replyResult = await replyCommand([targetUrl, "--agent-reply", "Updated live route"]);
+    assert.equal(replyResult.reply.status, "sent");
+    assert.equal(replyResult.reply.file, "http://localhost:9998/app/setup");
+
+    for (const entry of [
+      { fn: stopCommand, args: [] },
+      { fn: setupCommand, args: ["hooks"] },
+      { fn: serverCommand, args: [] },
+    ]) {
+      await assert.rejects(
+        async () => entry.fn(entry.args),
+        (/** @type {any} */ err) => {
+          assert.equal(err.code, "SERVER_ERROR");
+          assert.match(err.message, /reuse-only mode/);
+          return true;
+        },
+      );
+    }
+  } finally {
+    for (const [k, v] of Object.entries(previousEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    if (lavish) await lavish.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("/health omits wildcard CORS and wrapped-favicon enforces same-origin and 256 KiB cap", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-favicon-guard-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  /** @type {import("node:http").Server | null} */
+  let upstreamServer = null;
+  /** @type {import("node:http").Server | null} */
+  let foreignServer = null;
+  let foreignRequests = 0;
+  let iconMode = "foreign";
+  let lavish;
+
+  try {
+    const foreign = http.createServer((_req, res) => {
+      foreignRequests += 1;
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(Buffer.from("foreign-icon"));
+    });
+    foreignServer = foreign;
+    await new Promise((resolve) => foreign.listen(0, "127.0.0.1", () => resolve(undefined)));
+    const foreignPort = /** @type {import("node:net").AddressInfo} */ (foreign.address()).port;
+
+    const upstream = http.createServer((req, res) => {
+      if (req.url === "/oversized.png") {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.end(Buffer.alloc(300 * 1024, 0x41));
+        return;
+      }
+      if (req.url === "/html-fallback.ico") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end("<!doctype html><html><body>Not an image</body></html>");
+        return;
+      }
+      if (req.url === "/small.png") {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+        return;
+      }
+      const href =
+        iconMode === "foreign"
+          ? `http://127.0.0.1:${foreignPort}/leak.png`
+          : iconMode === "oversized"
+            ? "/oversized.png"
+            : iconMode === "html"
+              ? "/html-fallback.ico"
+              : "/small.png";
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><html><head><link rel="icon" href="${href}"></head><body><h1>App</h1></body></html>`);
+    });
+    upstreamServer = upstream;
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => resolve(undefined)));
+    const upstreamPort = /** @type {import("node:net").AddressInfo} */ (upstream.address()).port;
+
+    lavish = await serve({ port: 0, stateFile: stateFilePath });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+
+    const healthRes = await fetch(`${lavishBase}/health`, {
+      headers: { Origin: "https://attacker.example" },
+    });
+    assert.equal(healthRes.status, 200);
+    assert.equal(healthRes.headers.get("access-control-allow-origin"), null);
+
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: `http://127.0.0.1:${upstreamPort}/` }),
+    });
+    const { key } = await openRes.json();
+
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav1 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg1 = await fav1.text();
+    assert.equal(foreignRequests, 0, "cross-origin favicon must never be fetched");
+    assert.doesNotMatch(svg1, /data:image\//);
+
+    iconMode = "oversized";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav2 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg2 = await fav2.text();
+    assert.doesNotMatch(svg2, /data:image\//, "oversized favicon (>256 KiB) must be dropped");
+
+    iconMode = "html";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav3 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg3 = await fav3.text();
+    assert.doesNotMatch(svg3, /data:/, "non-image MIME response must not be embedded");
+
+    iconMode = "small";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav4 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg4 = await fav4.text();
+    assert.match(svg4, /data:image\/png;base64,/, "small same-origin image favicon must be embedded");
+  } finally {
+    if (lavish) await lavish.close();
+    if (upstreamServer) await new Promise((resolve) => upstreamServer.close(resolve));
+    if (foreignServer) await new Promise((resolve) => foreignServer.close(resolve));
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

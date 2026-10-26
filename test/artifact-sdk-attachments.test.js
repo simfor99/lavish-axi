@@ -408,3 +408,8 @@ test("the SDK bundle renders once per multi-file batch (D7)", () => {
   // ...instead of the old per-file loop that rendered N times.
   assert.doesNotMatch(sdk, /for \(const name of unsupported\) attachments\.rejectUnsupported\(name\)/);
 });
+
+test("the SDK bundle uses FileReader for CSP-robust data URL thumbnails", () => {
+  assert.match(sdk, /reader\.readAsDataURL/);
+  assert.match(sdk, /reader\.onload/);
+});

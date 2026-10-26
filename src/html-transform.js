@@ -30,6 +30,23 @@ export function transformProxyHtml(html, key, targetUrl, artifactRevision, artif
   const prefix = `/artifact/${encodeURIComponent(key)}/proxy`;
   let transformed = rewriteHtmlAttributes(html, prefix);
 
+  // Strip upstream CSP and X-Frame-Options meta tags so they don't break framing,
+  // SDK scripts, WebSocket connections, or blob:/data: images inside the Lavish proxy session.
+  transformed = transformed.replace(
+    /<meta\b[^>]*\bhttp-equiv=["']?(content-security-policy|x-frame-options)["']?[^>]*\/?>/gi,
+    "",
+  );
+
+  let pagePath = "/";
+  let targetPath = "/";
+  try {
+    const parsed = new URL(targetUrl);
+    pagePath = parsed.pathname || "/";
+    targetPath = (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
+  } catch {
+    // Ignore invalid target URL and fall back to root
+  }
+
   const proxyBootstrapScript = `<script>
 (function() {
   try {
@@ -52,6 +69,12 @@ export function transformProxyHtml(html, key, targetUrl, artifactRevision, artif
     } catch(err) {}
   }
   var prefix = ${JSON.stringify(prefix)};
+  var targetPath = ${JSON.stringify(targetPath)};
+  try {
+    if (window.location.pathname.startsWith("/artifact/")) {
+      window.history.replaceState(window.history.state, "", targetPath);
+    }
+  } catch(e) {}
   var origFetch = window.fetch;
   if (origFetch) {
     window.fetch = function(input, init) {
@@ -92,31 +115,18 @@ export function transformProxyHtml(html, key, targetUrl, artifactRevision, artif
   var origPushState = history.pushState;
   if (origPushState) {
     history.pushState = function(state, title, url) {
-      if (typeof url === "string" && url.startsWith("/") && !url.startsWith("/artifact/")) {
-        url = prefix + url;
-      }
       return origPushState.call(this, state, title, url);
     };
   }
   var origReplaceState = history.replaceState;
   if (origReplaceState) {
     history.replaceState = function(state, title, url) {
-      if (typeof url === "string" && url.startsWith("/") && !url.startsWith("/artifact/")) {
-        url = prefix + url;
-      }
       return origReplaceState.call(this, state, title, url);
     };
   }
 })();
 </script>`;
 
-  let pagePath = "/";
-  try {
-    const parsed = new URL(targetUrl);
-    pagePath = parsed.pathname || "/";
-  } catch {
-    // Ignore invalid target URL and fall back to root
-  }
   const baseTag = `<base href="${prefix}${pagePath}">`;
   if (/<head\b[^>]*>/i.test(transformed)) {
     transformed = transformed.replace(/<head\b[^>]*>/i, (m) => `${m}\n${baseTag}\n${proxyBootstrapScript}`);

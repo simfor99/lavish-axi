@@ -111,7 +111,12 @@ function cell(tag, text) {
   return element;
 }
 
-function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
+function bootSdk({
+  runAnimationFrames = false,
+  initialAnnotate = true,
+  revisionsScript = null,
+  revisionMarkElements = [],
+} = {}) {
   const posted = [];
   const clipboardWrites = [];
   const documentListeners = [];
@@ -132,6 +137,7 @@ function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
   const body = createElement("body");
   appendTo(documentElement, head);
   appendTo(documentElement, body);
+  for (const element of revisionMarkElements) appendTo(body, element);
 
   const sandbox = {
     parent: { postMessage: (message) => posted.push(message) },
@@ -167,8 +173,10 @@ function bootSdk({ runAnimationFrames = false, initialAnnotate = true } = {}) {
       removeEventListener() {},
       createElement,
       getElementById: (id) => elementsById.get(id) || null,
-      querySelector: (selector) => documentQuery(selector),
-      querySelectorAll: (selector) => documentQueryAll(selector),
+      querySelector: (selector) =>
+        selector === "script[data-lavish-revisions]" ? revisionsScript : documentQuery(selector),
+      querySelectorAll: (selector) =>
+        selector === "[data-lavish-revision]" ? revisionMarkElements : documentQueryAll(selector),
       getSelection: () => null,
     },
   };
@@ -327,6 +335,32 @@ test("the served SDK echoes the snapshot request id", () => {
   assert.equal(response.artifact_load_token, "load-token");
 });
 
+// readArtifactRevisions calls parseRevisionRegistry and collectRevisionMarks, which in turn call
+// the rest of the revision helper chain; a helper left out of the bundle only ReferenceErrors on
+// this real read, which a source-grep over the bundle text cannot catch.
+test("the served SDK bundle reports the artifact's own revision registry and marks", () => {
+  const revisionsScript = createElement("script");
+  revisionsScript.textContent = JSON.stringify([
+    { id: "r1", label: "Tightened header copy", summary: "Shortened the hero headline" },
+  ]);
+  const marked = createElement("h1");
+  marked.setAttribute("data-lavish-revision", "r1");
+  marked.textContent = "Ship faster";
+
+  const sdk = bootSdk({ revisionsScript, revisionMarkElements: [marked] });
+
+  const message = sdk.posted.find((entry) => entry.type === "lavish:revisions");
+  assert.ok(message, "the SDK reports the revision registry on load");
+  assert.equal(message.revisions.length, 1);
+  assert.equal(message.revisions[0].id, "r1");
+  assert.equal(message.revisions[0].label, "Tightened header copy");
+  assert.equal(message.revisions[0].mark_count, 1);
+  assert.equal(message.marks.length, 1);
+  assert.equal(message.marks[0].revision_id, "r1");
+  assert.equal(message.marks[0].selector, "html > body > h1");
+  assert.equal(message.marks[0].excerpt, "Ship faster");
+});
+
 test("the served SDK bundle queues a table-cell annotation without a missing-helper ReferenceError", () => {
   const sdk = bootSdk();
   const { evidence } = buildTable(sdk);
@@ -385,8 +419,12 @@ test("hovering a report card offers a Markdown copy control without opening an a
   const copyButton = sdk.copyButton();
   assert.ok(copyButton, "a compact copy control is placed over the hovered card");
   assert.equal(copyButton.hidden, false);
-  assert.equal(copyButton.style.top, "18px");
-  assert.equal(copyButton.style.left, "78px");
+  assert.equal(copyButton.style.top, "12px");
+  assert.equal(copyButton.style.left, "118px");
+  assert.ok(
+    Number.parseInt(copyButton.style.left, 10) >= reportCard.getBoundingClientRect().right,
+    "the copy control sits outside the text block, not over the text",
+  );
 
   const click = copyButton.listeners.find((entry) => entry.type === "click");
   assert.ok(click, "the control handles its own click");
@@ -408,8 +446,12 @@ test("the copy control attaches to the nearest hovered block, not a coarser ance
   sdk.trigger("mouseover", { target: meta });
   const copyButton = sdk.copyButton();
   assert.ok(copyButton, "the copy control appears for the hovered meta block");
-  assert.equal(copyButton.style.top, "128px", "the control sits on the meta block, not the scrolled card");
-  assert.equal(copyButton.style.left, "368px");
+  assert.equal(copyButton.style.top, "122px", "the control sits beside the meta block, not the scrolled card");
+  assert.equal(copyButton.style.left, "408px");
+  assert.ok(
+    Number.parseInt(copyButton.style.left, 10) >= meta.getBoundingClientRect().right,
+    "the control sits outside the text area",
+  );
 
   const click = copyButton.listeners.find((entry) => entry.type === "click");
   await click.handler({ preventDefault() {}, stopPropagation() {} });
@@ -426,13 +468,46 @@ test("scrolling a hovered block off-screen hides the copy control instead of pin
   const copyButton = sdk.copyButton();
   assert.ok(copyButton);
   assert.equal(copyButton.hidden, false);
-  assert.equal(copyButton.style.top, "48px");
-  assert.equal(copyButton.style.left, "980px");
+  assert.equal(copyButton.style.top, "42px");
+  assert.equal(copyButton.style.left, "1020px");
+  assert.ok(
+    Number.parseInt(copyButton.style.left, 10) >= notice.getBoundingClientRect().right,
+    "the control sits outside the text block",
+  );
 
   notice.getBoundingClientRect = () => ({ left: 400, top: -220, right: 1012, bottom: -140, width: 612, height: 80 });
   sdk.scroll();
   assert.equal(copyButton.hidden, true, "the control must not stick to the viewport corner");
   assert.equal(sdk.copyButton() && sdk.copyButton().hidden, true);
+});
+
+test("the copy control falls back outside to the left or above when the right margin has no room", () => {
+  const sdk = bootSdk({ initialAnnotate: false });
+  const rightBlocked = appendTo(sdk.body, cell("aside", "Kein Platz rechts"));
+  rightBlocked.className = "notice";
+  rightBlocked.getBoundingClientRect = () => ({ left: 800, top: 40, right: 1270, bottom: 120, width: 470, height: 80 });
+
+  sdk.trigger("mouseover", { target: rightBlocked });
+  const copyButton = sdk.copyButton();
+  assert.ok(copyButton);
+  assert.equal(copyButton.hidden, false);
+  assert.equal(copyButton.style.left, "768px");
+  assert.ok(
+    Number.parseInt(copyButton.style.left, 10) + 24 <= rightBlocked.getBoundingClientRect().left,
+    "sits outside on the left",
+  );
+
+  const fullWidth = appendTo(sdk.body, cell("aside", "Volle Breite"));
+  fullWidth.className = "notice";
+  fullWidth.getBoundingClientRect = () => ({ left: 10, top: 60, right: 1270, bottom: 160, width: 1260, height: 100 });
+
+  sdk.trigger("mouseover", { target: fullWidth });
+  assert.equal(copyButton.hidden, false);
+  assert.equal(copyButton.style.top, "32px");
+  assert.ok(
+    Number.parseInt(copyButton.style.top, 10) + 24 <= fullWidth.getBoundingClientRect().top,
+    "sits outside above the text",
+  );
 });
 
 test("scroll position marks the current sidebar section, including the final sources section", () => {
@@ -516,6 +591,115 @@ function pressEscape(textarea) {
   assert.ok(listener, "the annotation textarea registers a keydown listener");
   listener.handler({ key: "Escape", preventDefault() {} });
 }
+
+test("review capture reports a native answer before the debounce and refuses changed question restoration", () => {
+  const sdk = bootSdk();
+  const scope = createElement("form");
+  scope.setAttribute("data-lavish-question", "decision");
+  scope.textContent = "Which approach?";
+  const input = createElement("input");
+  input.setAttribute("name", "note");
+  input.defaultValue = "";
+  input.value = "My unfinished answer";
+  scope.querySelectorAll = () => [input];
+  sdk.setDocumentQueryAll((selector) => (selector === "[data-lavish-question]" ? [scope] : []));
+  sdk.sendChromeMessage({ type: "lavish:requestReviewState", request_id: "before-switch" });
+  const captured = sdk.posted.find((item) => item.type === "lavish:reviewState" && item.request_id === "before-switch");
+  assert.ok(captured);
+  assert.equal(captured.state.fields[0].dirty, true);
+  assert.equal(captured.state.fields[0].value, "My unfinished answer");
+  scope.textContent = "A materially different question";
+  input.value = "";
+  sdk.sendChromeMessage({ type: "lavish:restoreReviewState", state: captured.state });
+  assert.equal(input.value, "", "changed context must not receive the old answer");
+  assert.ok(
+    sdk.posted.some(
+      (item) => item.type === "lavish:reviewDraftRecovered" && item.text.includes("My unfinished answer"),
+    ),
+  );
+});
+
+test("only acknowledged native answers become clean and later edits remain drafts", () => {
+  const sdk = bootSdk();
+  const scope = createElement("form");
+  scope.setAttribute("data-lavish-question", "decision");
+  scope.closest = () => scope;
+  const input = createElement("input");
+  input.value = "answer";
+  input.defaultValue = "";
+  scope.querySelectorAll = () => [input];
+  sdk.setDocumentQueryAll((selector) => (selector === "[data-lavish-question]" ? [scope] : []));
+  const capture = () => {
+    sdk.sendChromeMessage({ type: "lavish:requestReviewState", request_id: "answer" });
+    return sdk.posted.filter((item) => item.request_id === "answer").at(-1).state.fields[0];
+  };
+  sdk.api.queuePrompt("answer", { element: scope });
+  const request = sdk.posted.find((item) => item.type === "lavish:queuePrompt");
+  assert.equal(capture().dirty, true);
+  sdk.sendChromeMessage({
+    type: "lavish:questionQueued",
+    review_request_id: request.review_request_id,
+    accepted: true,
+  });
+  assert.equal(capture().dirty, false);
+  input.value = "new answer";
+  assert.equal(capture().dirty, true);
+  sdk.api.queuePrompt("new answer", { element: scope });
+  const rejected = sdk.posted.filter((item) => item.type === "lavish:queuePrompt").at(-1);
+  sdk.sendChromeMessage({
+    type: "lavish:questionQueued",
+    review_request_id: rejected.review_request_id,
+    accepted: false,
+  });
+  assert.equal(capture().dirty, true);
+});
+
+test("native select defaults are clean and changes preserve every selected value", () => {
+  const sdk = bootSdk();
+  const scope = createElement("form");
+  scope.setAttribute("data-lavish-question", "selection");
+  const select = createElement("select");
+  select.type = "select-multiple";
+  select.multiple = true;
+  select.options = [
+    { value: "one", defaultSelected: true, selected: true },
+    { value: "two", defaultSelected: false, selected: false },
+  ];
+  select.value = "one";
+  scope.querySelectorAll = () => [select];
+  sdk.setDocumentQueryAll((selector) => (selector === "[data-lavish-question]" ? [scope] : []));
+  const capture = () => {
+    sdk.sendChromeMessage({ type: "lavish:requestReviewState", request_id: "select" });
+    return sdk.posted.filter((item) => item.request_id === "select").at(-1).state;
+  };
+  assert.equal(capture().fields[0].dirty, false);
+  select.options[1].selected = true;
+  const changed = capture();
+  assert.equal(changed.fields[0].dirty, true);
+  assert.deepEqual(Array.from(changed.fields[0].selectedValues), ["one", "two"]);
+  select.options[1].selected = false;
+  sdk.sendChromeMessage({ type: "lavish:restoreReviewState", state: changed });
+  assert.equal(select.options[1].selected, true);
+});
+
+test("changed explicit decision context recovers an answer even with identical form text", () => {
+  const sdk = bootSdk();
+  const scope = createElement("form");
+  scope.setAttribute("data-lavish-question", "decision");
+  scope.setAttribute("data-lavish-question-context", "original subject");
+  const input = createElement("input");
+  input.value = "unfinished";
+  input.defaultValue = "";
+  scope.querySelectorAll = () => [input];
+  sdk.setDocumentQueryAll((selector) => (selector === "[data-lavish-question]" ? [scope] : []));
+  sdk.sendChromeMessage({ type: "lavish:requestReviewState", request_id: "context" });
+  const state = sdk.posted.find((item) => item.request_id === "context").state;
+  scope.setAttribute("data-lavish-question-context", "different subject");
+  input.value = "";
+  sdk.sendChromeMessage({ type: "lavish:restoreReviewState", state });
+  assert.equal(input.value, "");
+  assert.ok(sdk.posted.some((item) => item.type === "lavish:reviewDraftRecovered"));
+});
 
 test("Escape closes an annotation card with no text and no attachment", () => {
   const sdk = bootSdk();
@@ -622,6 +806,29 @@ test("the served SDK bundle restores a draft whose anchor arrives after the load
   assert.equal(sdk.card().querySelector("textarea").value, "needs a shorter headline");
 });
 
+test("the served SDK bundle restores an anchored draft across an artifactRevision increment", () => {
+  const sdk = bootSdk();
+  const hero = appendTo(sdk.body, cell("h1", "Headline"));
+  hero.id = "hero";
+  sdk.setDocumentQuery((selector) => (selector === "#hero" ? hero : null));
+
+  sdk.sendChromeMessage({
+    type: "lavish:restoreReviewState",
+    state: {
+      card: { selector: "#hero", text: "keep anchored across reload", revision: 1 },
+      fields: [],
+    },
+  });
+  sdk.runTimers();
+
+  assert.equal(
+    sdk.posted.some((message) => message.type === "lavish:reviewDraftRecovered"),
+    false,
+    "a revision increment on reload must re-anchor the draft instead of detaching it",
+  );
+  assert.equal(sdk.card().querySelector("textarea").value, "keep anchored across reload");
+});
+
 test("the served SDK bundle reports nothing when there is no draft to restore", () => {
   const sdk = bootSdk();
   const before = sdk.posted.length;
@@ -689,4 +896,102 @@ test("the served SDK bundle drops a late restore once the user has opened a card
     sdk.posted.some((message) => message.type === "lavish:reviewDraftUnrestorable"),
     false,
   );
+});
+
+test("clicking an element with a queued note asks the chrome to edit it instead of opening a card", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.click(paragraph);
+  const queued = sdk.queue("Reword this");
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [queued.prompt.selector] });
+  // The stub shadow root keeps closed cards, so a new card shows as a higher count.
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(paragraph);
+
+  assert.equal(sdk.cards().length, cardsBefore);
+  const message = sdk.posted.at(-1);
+  assert.equal(message.type, "lavish:editQueuedAnchor");
+  assert.equal(message.selector, queued.prompt.selector);
+  assert.equal(message.artifact_load_token, "load-token");
+});
+
+test("an element whose queued note left the queue opens a fresh card again", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.click(paragraph);
+  const queued = sdk.queue("Reword this");
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [queued.prompt.selector] });
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [] });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(paragraph);
+
+  assert.equal(sdk.cards().length, cardsBefore + 1);
+});
+
+test("the chrome can hand an element click back for a fresh card", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.setDocumentQuery((selector) => (selector === "body > p" ? paragraph : null));
+
+  sdk.sendChromeMessage({ type: "lavish:annotateElement", selector: "body > p" });
+
+  assert.match(sdk.card().innerHTML, /Annotate &lt;p&gt;/);
+});
+
+// A Mermaid node as the SDK sees one: a `<g class="node">` inside an SVG Mermaid rendered.
+function buildMermaidNode(sdk) {
+  const svg = appendTo(sdk.body, createElement("svg"));
+  svg.id = "mermaid-1";
+  const node = appendTo(svg, createElement("g"));
+  node.id = "flowchart-A-0";
+  const matchesTag = node.matches;
+  node.matches = (selectorList) =>
+    String(selectorList)
+      .split(",")
+      .some((part) => part.trim() === "g.node") || matchesTag(selectorList);
+  const label = appendTo(node, cell("span", "Start"));
+  const shape = appendTo(node, createElement("rect"));
+  return { label, shape };
+}
+
+test("a note queued from a diagram node's label opens again from the node's shape", () => {
+  const sdk = bootSdk();
+  const { label, shape } = buildMermaidNode(sdk);
+  sdk.click(label);
+  const queued = sdk.queue("Rename this step");
+  sdk.sendChromeMessage({
+    type: "lavish:queuedAnchors",
+    selectors: [queued.prompt.selector, queued.prompt.target.selector],
+  });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(shape);
+
+  assert.equal(sdk.cards().length, cardsBefore);
+  const message = sdk.posted.at(-1);
+  assert.equal(message.type, "lavish:editQueuedAnchor");
+  assert.equal(message.selector, queued.prompt.target.selector);
+});
+
+test("a click inside a table cell opens only the note on the exact element clicked", () => {
+  const sdk = bootSdk();
+  const { evidence } = buildTable(sdk);
+  const strong = appendTo(evidence, cell("strong", "Drive"));
+  const em = appendTo(evidence, cell("em", "Cursor"));
+  sdk.click(evidence);
+  const cellNote = sdk.queue("Explain this cell");
+  sdk.click(strong);
+  const strongNote = sdk.queue("Explain this app");
+  sdk.sendChromeMessage({
+    type: "lavish:queuedAnchors",
+    selectors: [cellNote.prompt.selector, strongNote.prompt.selector],
+  });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(em);
+
+  assert.equal(sdk.cards().length, cardsBefore + 1);
+  assert.notEqual(sdk.posted.at(-1)?.type, "lavish:editQueuedAnchor");
 });
