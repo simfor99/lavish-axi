@@ -1653,8 +1653,8 @@ function commitQueuedEdit() {
   const prompt = queued[index];
   if (!isPromptEditable(prompt)) return false;
   if (!text && !attachmentCount(prompt)) {
-    queued.splice(index, 1);
-    afterQueuedPromptRemoved();
+    const [removed] = queued.splice(index, 1);
+    afterQueuedPromptRemoved(removed);
   } else {
     // In place, not replaced: the send bookkeeping tracks notes by object identity.
     prompt.prompt = text;
@@ -1752,19 +1752,19 @@ function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   if (terminalSubmission || isPromptSending(queued[index])) return;
   const [removed] = queued.splice(index, 1);
-  afterQueuedPromptRemoved();
+  afterQueuedPromptRemoved(removed);
   render();
-  // A queued repair reserves its warning IDs. Explicit removal releases them
-  // immediately, without waiting for another server warning event.
-  if (removed?.tag === "layout-warnings") renderWarnings();
 }
 
-function afterQueuedPromptRemoved() {
+function afterQueuedPromptRemoved(removed) {
   persistQueuedPrompts();
   if (!queued.length) {
     clearSendAcknowledgementWarning();
     if (sendFailureOwner?.kind !== "preparation") clearPersistentSendFailure();
   }
+  // A queued repair reserves its warning IDs. Explicit removal or inline-clear
+  // releases them immediately, without waiting for another server warning event.
+  if (removed?.tag === "layout-warnings") renderWarnings();
 }
 
 function promptQueueKey(prompt) {

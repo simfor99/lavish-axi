@@ -274,7 +274,7 @@ export function normalizeArgv(argv) {
     return argv;
   }
   if (first.startsWith("-")) {
-    return argv.some((arg) => isHtmlPath(arg)) ? ["open", ...argv] : argv;
+    return argv.some((arg) => isHtmlPath(arg) || isHttpUrl(arg)) ? ["open", ...argv] : argv;
   }
   return ["open", ...argv];
 }
@@ -567,11 +567,11 @@ async function pollCommand(args) {
 const REPLY_VALUE_FLAGS = ["--agent-reply", "--agent-reply-file"];
 const REPLY_TOO_LARGE_HELP = "Shorten the reply, then retry `lavish-axi reply <html-file>`";
 
-async function replyCommand(args) {
+export async function replyCommand(args) {
   const file = firstPositionalArg(args, REPLY_VALUE_FLAGS);
   if (!file) {
-    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", [
-      'Run `lavish-axi reply <html-file> --agent-reply "<message>"`',
+    throw new AxiError("HTML file path or URL is required", "VALIDATION_ERROR", [
+      'Run `lavish-axi reply <html-file|url> --agent-reply "<message>"`',
     ]);
   }
   const inline = inspectValueFlag(args, "--agent-reply");
@@ -588,7 +588,7 @@ async function replyCommand(args) {
       'Pass --agent-reply "<message>" or --agent-reply-file <path> with a non-empty body',
     ]);
   }
-  await assertHtmlFile(file);
+  if (!isHttpUrl(file)) await assertHtmlFile(file);
   const absolute = await canonicalFile(file);
   const baseUrl = await ensureServer();
   await postAgentReply(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, text, absolute);
@@ -1319,9 +1319,20 @@ function generatedPasswordNote(password) {
   );
 }
 
+function assertNotReuseOnlyLifecycle(commandName) {
+  if (process.env.LAVISH_AXI_REUSE_ONLY === "1") {
+    throw new AxiError(
+      `\`lavish-axi ${commandName}\` cannot run in reuse-only mode (LAVISH_AXI_REUSE_ONLY=1)`,
+      "SERVER_ERROR",
+      ["Unset LAVISH_AXI_REUSE_ONLY when managing the Lavish server or host integrations directly"],
+    );
+  }
+}
+
 // Explicitly shut down the running Lavish Editor server. Unlike `end` (which closes a single
 // session), this stops the background process so it stops dangling between sessions.
 export async function stopCommand(args) {
+  assertNotReuseOnlyLifecycle("stop");
   const port = Number(flagValue(args, "--port") || defaultPort());
   // A server that fell back to loopback answers there rather than at the requested bind host, and
   // a `stop` that only dials the requested host reports "not-running" while leaving it running.
@@ -1368,7 +1379,8 @@ async function designCommand() {
   return createDesignOutput();
 }
 
-async function setupCommand(args) {
+export async function setupCommand(args) {
+  assertNotReuseOnlyLifecycle("setup");
   if (args.length !== 1 || (args[0] !== "hooks" && args[0] !== "plugin")) {
     throw new AxiError("Unknown setup action", "VALIDATION_ERROR", [
       "Run `lavish-axi setup hooks`",
@@ -1729,7 +1741,8 @@ function deepEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-async function serverCommand(args) {
+export async function serverCommand(args) {
+  assertNotReuseOnlyLifecycle("server");
   const port = Number(flagValue(args, "--port") || defaultPort());
   const debug = args.includes("--verbose") || process.env.LAVISH_AXI_DEBUG === "1";
   const server = await serve({

@@ -8948,3 +8948,29 @@ test("a keyed replacement of an untouched open edit leaves no unsent note", asyn
   assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
   assert.equal(retiredDraftNotes(chrome).length, 0);
 });
+
+test("clearing a queued layout-warnings prompt via inline edit re-enables its warning checkbox immediately", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [
+      {
+        uid: "",
+        prompt: "Fix layout warning w1",
+        selector: "",
+        tag: "layout-warnings",
+        text: "Layout issue: 1 selected",
+        target: { type: "layout-warnings", artifact_revision: 1, warnings: [{ id: "w1" }] },
+      },
+    ],
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload({ id: "w1", selectable: true })] }),
+  });
+  assert.equal(chrome.warningRows()[0].children[0].disabled, true);
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "   ");
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["queued-edit-save"], 0) });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.warningRows()[0].children[0].disabled, false);
+});

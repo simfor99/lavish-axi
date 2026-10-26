@@ -322,3 +322,74 @@ test("Lavish session custom title persistence and chrome rendering", async () =>
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("normalizeArgv and replyCommand accept HTTP(S) URLs and reuse-only rejects lifecycle commands", async () => {
+  const { normalizeArgv, replyCommand, serverCommand, setupCommand, stopCommand } = await import("../src/cli.js");
+
+  assert.deepEqual(normalizeArgv(["--title", "Audit", "https://example.com/app"]), [
+    "open",
+    "--title",
+    "Audit",
+    "https://example.com/app",
+  ]);
+  assert.deepEqual(normalizeArgv(["--no-open", "http://127.0.0.1:8000/setup"]), [
+    "open",
+    "--no-open",
+    "http://127.0.0.1:8000/setup",
+  ]);
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-url-reply-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  let lavish;
+  const previousEnv = {
+    LAVISH_AXI_PORT: process.env.LAVISH_AXI_PORT,
+    LAVISH_AXI_HOST: process.env.LAVISH_AXI_HOST,
+    LAVISH_AXI_STATE_DIR: process.env.LAVISH_AXI_STATE_DIR,
+    LAVISH_AXI_REUSE_ONLY: process.env.LAVISH_AXI_REUSE_ONLY,
+  };
+  try {
+    const pkg = JSON.parse(
+      await (await import("node:fs/promises")).readFile(new URL("../package.json", import.meta.url), "utf8"),
+    );
+    lavish = await serve({ port: 0, stateFile: stateFilePath, version: pkg.version });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+    const targetUrl = "http://127.0.0.1:9998/app/setup";
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: targetUrl }),
+    });
+    assert.equal(openRes.status, 200);
+
+    process.env.LAVISH_AXI_PORT = String(lavish.port);
+    process.env.LAVISH_AXI_HOST = "127.0.0.1";
+    process.env.LAVISH_AXI_STATE_DIR = tempDir;
+    process.env.LAVISH_AXI_REUSE_ONLY = "1";
+
+    const replyResult = await replyCommand([targetUrl, "--agent-reply", "Updated live route"]);
+    assert.equal(replyResult.reply.status, "sent");
+    assert.equal(replyResult.reply.file, "http://localhost:9998/app/setup");
+
+    for (const entry of [
+      { fn: stopCommand, args: [] },
+      { fn: setupCommand, args: ["hooks"] },
+      { fn: serverCommand, args: [] },
+    ]) {
+      await assert.rejects(
+        async () => entry.fn(entry.args),
+        (/** @type {any} */ err) => {
+          assert.equal(err.code, "SERVER_ERROR");
+          assert.match(err.message, /reuse-only mode/);
+          return true;
+        },
+      );
+    }
+  } finally {
+    for (const [k, v] of Object.entries(previousEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    if (lavish) await lavish.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
