@@ -9003,3 +9003,45 @@ test("Check and reload succeeds immediately without SDK capture timeout when ini
   );
   assert.equal(chrome.reloadCount(), 1);
 });
+
+test("chrome reload skips SDK capture when artifactLoadToken was issued to a silent error page, and captures once SDK spoke", async () => {
+  const silent = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialArtifactLoadToken: "load-1" },
+    artifactSrc: "/artifact/abc/index.html",
+    acknowledgeReviewCapture: false,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  sendChromeOutdated(silent, "upgrade");
+  await silent.element("outdatedReload").click();
+  await flushPromises();
+
+  assert.equal(
+    silent.postedToFrame.some((msg) => msg.type === "lavish:requestReviewState"),
+    false,
+    "must not wait for SDK capture when the artifact never spoke for this load token",
+  );
+  assert.equal(silent.reloadCount(), 1);
+
+  const live = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialArtifactLoadToken: "load-2" },
+    artifactSrc: "/artifact/abc/index.html",
+    acknowledgeReviewCapture: true,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+  live.sendFrameMessage({
+    type: "lavish:setLinkHost",
+    mode: "localhost",
+    artifact_load_token: live.artifactLoadToken(),
+  });
+  sendChromeOutdated(live, "upgrade");
+  await live.element("outdatedReload").click();
+  await flushPromises();
+
+  assert.equal(
+    live.postedToFrame.some((msg) => msg.type === "lavish:requestReviewState"),
+    true,
+    "must capture latest review state once the SDK spoke with the active load token",
+  );
+  assert.equal(live.reloadCount(), 1);
+});

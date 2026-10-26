@@ -4275,7 +4275,7 @@ async function reloadChromePreservingDraft(explicit, reason = "") {
   reviewSwitchInFlight = true;
   let navigating = false;
   try {
-    const hasLoadedArtifact = Boolean(artifactSrc && artifactLoadToken);
+    const hasLoadedArtifact = Boolean(artifactSrc && artifactLoadToken && artifactSpokeToken === artifactLoadToken);
     const captured = !hasLoadedArtifact || (await captureLatestReviewState());
     const persisted = !lastReviewState || saveJsonState(reviewStateStorageKey, lastReviewState);
     if (
@@ -4435,13 +4435,14 @@ window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
 
   const msg = event.data || {};
+  const messageToken = String(msg.artifact_load_token || "");
   // The artifact has an opaque origin. Keep this two-value preference on the
   // chrome URL so its referrer restores the choice after reload and navigation.
   if (msg.type === "lavish:setLinkHost") {
+    if (artifactLoadToken && messageToken === artifactLoadToken) artifactSpokeToken = messageToken;
     persistArtifactLinkHost(msg.mode);
     return;
   }
-  const messageToken = String(msg.artifact_load_token || "");
   if (messageToken !== artifactLoadToken) {
     // A pass can be stamped by the load that just lost a token race. Ask the current artifact
     // document to run the audit again instead of consuming the only pass for this cycle.
