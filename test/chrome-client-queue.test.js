@@ -8974,3 +8974,32 @@ test("clearing a queued layout-warnings prompt via inline edit re-enables its wa
   assert.deepEqual(chrome.queued(), []);
   assert.equal(chrome.warningRows()[0].children[0].disabled, false);
 });
+
+test("Check and reload succeeds immediately without SDK capture timeout when initial artifact load failed", async () => {
+  const beginLoadResponses = [];
+  for (let i = 0; i < 40; i += 1) beginLoadResponses.push({ ok: false, status: 503 });
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialArtifactLoadToken: "" },
+    artifactSrc: "/artifact/abc/index.html",
+    beginLoadResponses,
+    acknowledgeReviewCapture: false,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  await exhaustOneBeginLoadAttempt(chrome);
+  for (const delay of [1000, 3000, 8000, 20000]) {
+    chrome.runTimers(delay);
+    await exhaustOneBeginLoadAttempt(chrome);
+  }
+
+  assert.equal(chrome.element("layoutGateAction").textContent, "Check and reload");
+  await chrome.element("layoutGateAction").click();
+  await flushPromises();
+
+  assert.equal(
+    chrome.postedToFrame.some((msg) => msg.type === "lavish:requestReviewState"),
+    false,
+    "must not wait for SDK capture when no artifactLoadToken was issued",
+  );
+  assert.equal(chrome.reloadCount(), 1);
+});

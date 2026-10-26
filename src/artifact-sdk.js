@@ -1284,7 +1284,7 @@ export function createArtifactSdk(
       textarea.select();
       const copied = document.execCommand?.("copy");
       textarea.remove();
-      return Boolean(copied !== false);
+      return copied === true;
     } catch {
       return false;
     }
@@ -1346,8 +1346,8 @@ export function createArtifactSdk(
       copyButton.type = "button";
       copyButton.className = "lavish-copy-markdown";
       copyButton.setAttribute("data-lavish-ui", "copy-markdown");
-      copyButton.setAttribute("aria-label", "Inhalt als Markdown kopieren");
-      copyButton.title = "Als Markdown kopieren";
+      copyButton.setAttribute("aria-label", "Copy content as Markdown");
+      copyButton.title = "Copy as Markdown";
       copyButton.innerHTML = "⧉";
       copyButton.addEventListener("mouseenter", () => {
         if (copyHideTimer) window.clearTimeout(copyHideTimer);
@@ -1361,11 +1361,11 @@ export function createArtifactSdk(
         if (!copyTarget) return;
         const copied = await copyMarkdown(copyTarget);
         copyButton.textContent = copied ? "✓" : "!";
-        copyButton.title = copied ? "Markdown kopiert" : "Kopieren nicht möglich";
+        copyButton.title = copied ? "Markdown copied" : "Copy failed";
         window.setTimeout(() => {
           if (!copyButton) return;
           copyButton.textContent = "⧉";
-          copyButton.title = "Als Markdown kopieren";
+          copyButton.title = "Copy as Markdown";
         }, 1200);
       });
       root.appendChild(copyButton);
@@ -1383,22 +1383,10 @@ export function createArtifactSdk(
       const style = document.createElement("style");
       style.id = styleId;
       style.textContent =
-        "nav a[data-lavish-active-nav='true'],.toc a[data-lavish-active-nav='true']{background:var(--lavish-nav-active-bg,rgba(244,201,93,.22))!important;color:var(--lavish-nav-active-ink,#fff)!important;box-shadow:inset 3px 0 0 var(--lavish-nav-active-accent,#f4c95d)}" +
-        ".rail,.review-rail,aside[class*='rail']{overflow-x:hidden!important;overscroll-behavior-x:none!important;left:0!important}" +
-        ".rail>*,.review-rail>*,aside[class*='rail']>*{min-width:0!important;max-width:100%!important;box-sizing:border-box!important}";
+        "nav a[data-lavish-active-nav='true'],.toc a[data-lavish-active-nav='true']{background:var(--lavish-nav-active-bg,rgba(244,201,93,.22))!important;color:var(--lavish-nav-active-ink,#fff)!important;box-shadow:inset 3px 0 0 var(--lavish-nav-active-accent,#f4c95d)}";
       document.head.appendChild(style);
     }
-    function clampRailScroll() {
-      const rails = document.querySelectorAll(".rail, .review-rail, aside[class*='rail']");
-      for (const r of rails) {
-        if (r.scrollLeft !== 0) {
-          r.scrollLeft = 0;
-        }
-      }
-    }
-    clampRailScroll();
     function update() {
-      clampRailScroll();
       const entries = [...document.querySelectorAll("nav a[href^='#'],.toc a[href^='#']")]
         .map((link) => ({ link, id: String(link.getAttribute("href") || "").slice(1) }))
         .map((entry) => ({ ...entry, section: entry.id ? document.getElementById(entry.id) : null }))
@@ -1419,7 +1407,6 @@ export function createArtifactSdk(
     }
     let frame = 0;
     const schedule = () => {
-      clampRailScroll();
       if (frame) return;
       frame = window.requestAnimationFrame(() => {
         frame = 0;
@@ -2567,7 +2554,7 @@ export function createArtifactSdk(
       }
     }
     const card = state.card;
-    if (card && (card.unbound || (card.revision !== undefined && card.revision !== artifactRevision))) {
+    if (card && card.unbound) {
       postArtifactMessage("lavish:reviewDraftRecovered", { card, text: String(card.text || "") });
       return;
     }
@@ -3122,7 +3109,7 @@ export function createArtifactSdk(
           const row = code.parentElement?.parentElement;
           if (!row) return;
           const url = urls[index];
-          code.textContent = url || "Remote nicht verfügbar";
+          code.textContent = url || "Remote unavailable";
           const button = row.querySelector("button");
           if (button) {
             button.removeAttribute("onclick");
@@ -3155,9 +3142,14 @@ export function createArtifactSdk(
         status.setAttribute("aria-live", "polite");
         card.appendChild(status);
       }
+      const copyLabel = button.getAttribute("data-copy-label") || "Session";
       status.textContent = success
-        ? `${button.getAttribute("data-copy-label") || "Session"}-Adresse kopiert ✓`
-        : "Kopieren fehlgeschlagen. Adresse auswählen und manuell kopieren.";
+        ? isGerman
+          ? `${copyLabel}-Adresse kopiert ✓`
+          : `${copyLabel} address copied ✓`
+        : isGerman
+          ? "Kopieren fehlgeschlagen. Adresse auswählen und manuell kopieren."
+          : "Copy failed. Select the address and copy it manually.";
     }
     if (success) {
       button.classList.remove("copy-error");

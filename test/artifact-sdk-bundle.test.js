@@ -806,6 +806,29 @@ test("the served SDK bundle restores a draft whose anchor arrives after the load
   assert.equal(sdk.card().querySelector("textarea").value, "needs a shorter headline");
 });
 
+test("the served SDK bundle restores an anchored draft across an artifactRevision increment", () => {
+  const sdk = bootSdk();
+  const hero = appendTo(sdk.body, cell("h1", "Headline"));
+  hero.id = "hero";
+  sdk.setDocumentQuery((selector) => (selector === "#hero" ? hero : null));
+
+  sdk.sendChromeMessage({
+    type: "lavish:restoreReviewState",
+    state: {
+      card: { selector: "#hero", text: "keep anchored across reload", revision: 1 },
+      fields: [],
+    },
+  });
+  sdk.runTimers();
+
+  assert.equal(
+    sdk.posted.some((message) => message.type === "lavish:reviewDraftRecovered"),
+    false,
+    "a revision increment on reload must re-anchor the draft instead of detaching it",
+  );
+  assert.equal(sdk.card().querySelector("textarea").value, "keep anchored across reload");
+});
+
 test("the served SDK bundle reports nothing when there is no draft to restore", () => {
   const sdk = bootSdk();
   const before = sdk.posted.length;

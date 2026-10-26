@@ -19,6 +19,7 @@ test("isLoopbackHost identifies loopback addresses and rejects remote/network ho
   assert.equal(isLoopbackHost("[::1]"), true);
   assert.equal(isLoopbackHost("sub.localhost"), true);
   assert.equal(isLoopbackHost("127.0.1.1"), true);
+  assert.equal(isLoopbackHost("127.evil.example"), false);
   assert.equal(isLoopbackHost("ryzen.tail0df162.ts.net"), false);
   assert.equal(isLoopbackHost("100.64.0.1"), false);
   assert.equal(isLoopbackHost("192.168.1.1"), false);

@@ -252,24 +252,26 @@ test("reply exits 0 only after the server accepts, delivers the reply, and clear
 });
 
 test("reply refuses a missing session, an unreachable server, and a non-success response", async () => {
-  await withArtifact(async ({ artifact, env, stateFile }) => {
-    await chmod(stateFile, 0o000);
-    try {
-      const refused = await runCli(["reply", artifact, "--agent-reply", "should not land"], { env });
-      assert.notEqual(refused.status, 0);
-      assert.match(refused.stdout, /did not accept the agent reply \(500\)/);
-      assert.match(refused.stdout, /SERVER_ERROR/);
-      assert.doesNotMatch(refused.stdout, /status: sent/);
-    } finally {
-      await chmod(stateFile, 0o644);
-    }
-    const stored = JSON.parse(await readFile(stateFile, "utf8"));
-    const chat = Object.values(stored.sessions)[0].chat || [];
-    assert.equal(
-      chat.some((entry) => entry.text === "should not land"),
-      false,
-    );
-  });
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    await withArtifact(async ({ artifact, env, stateFile }) => {
+      await chmod(stateFile, 0o000);
+      try {
+        const refused = await runCli(["reply", artifact, "--agent-reply", "should not land"], { env });
+        assert.notEqual(refused.status, 0);
+        assert.match(refused.stdout, /did not accept the agent reply \(500\)/);
+        assert.match(refused.stdout, /SERVER_ERROR/);
+        assert.doesNotMatch(refused.stdout, /status: sent/);
+      } finally {
+        await chmod(stateFile, 0o644);
+      }
+      const stored = JSON.parse(await readFile(stateFile, "utf8"));
+      const chat = Object.values(stored.sessions)[0].chat || [];
+      assert.equal(
+        chat.some((entry) => entry.text === "should not land"),
+        false,
+      );
+    });
+  }
 
   await withArtifact(
     async ({ artifact, env }) => {

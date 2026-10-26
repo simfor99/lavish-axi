@@ -19,7 +19,7 @@ export function isLoopbackHost(host) {
     unbracketed === "127.0.0.1" ||
     unbracketed === "::1" ||
     unbracketed.endsWith(".localhost") ||
-    unbracketed.startsWith("127.")
+    (isIP(unbracketed) === 4 && unbracketed.startsWith("127."))
   );
 }
 

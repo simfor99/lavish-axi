@@ -393,3 +393,73 @@ test("normalizeArgv and replyCommand accept HTTP(S) URLs and reuse-only rejects 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("/health omits wildcard CORS and wrapped-favicon enforces same-origin and 256 KiB cap", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "lavish-favicon-guard-test-"));
+  const stateFilePath = path.join(tempDir, "state.json");
+  /** @type {import("node:http").Server | null} */
+  let upstreamServer = null;
+  /** @type {import("node:http").Server | null} */
+  let foreignServer = null;
+  let foreignRequests = 0;
+  let iconMode = "foreign";
+  let lavish;
+
+  try {
+    const foreign = http.createServer((_req, res) => {
+      foreignRequests += 1;
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(Buffer.from("foreign-icon"));
+    });
+    foreignServer = foreign;
+    await new Promise((resolve) => foreign.listen(0, "127.0.0.1", () => resolve(undefined)));
+    const foreignPort = /** @type {import("node:net").AddressInfo} */ (foreign.address()).port;
+
+    const upstream = http.createServer((req, res) => {
+      if (req.url === "/oversized.png") {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.end(Buffer.alloc(300 * 1024, 0x41));
+        return;
+      }
+      const href = iconMode === "foreign" ? `http://127.0.0.1:${foreignPort}/leak.png` : "/oversized.png";
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><html><head><link rel="icon" href="${href}"></head><body><h1>App</h1></body></html>`);
+    });
+    upstreamServer = upstream;
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", () => resolve(undefined)));
+    const upstreamPort = /** @type {import("node:net").AddressInfo} */ (upstream.address()).port;
+
+    lavish = await serve({ port: 0, stateFile: stateFilePath });
+    const lavishBase = `http://127.0.0.1:${lavish.port}`;
+
+    const healthRes = await fetch(`${lavishBase}/health`, {
+      headers: { Origin: "https://attacker.example" },
+    });
+    assert.equal(healthRes.status, 200);
+    assert.equal(healthRes.headers.get("access-control-allow-origin"), null);
+
+    const openRes = await fetch(`${lavishBase}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: `http://127.0.0.1:${upstreamPort}/` }),
+    });
+    const { key } = await openRes.json();
+
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav1 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg1 = await fav1.text();
+    assert.equal(foreignRequests, 0, "cross-origin favicon must never be fetched");
+    assert.doesNotMatch(svg1, /data:image\//);
+
+    iconMode = "oversized";
+    await fetch(`${lavishBase}/session/${key}`);
+    const fav2 = await fetch(`${lavishBase}/artifact/${key}/wrapped-favicon.svg`);
+    const svg2 = await fav2.text();
+    assert.doesNotMatch(svg2, /data:image\//, "oversized favicon (>256 KiB) must be dropped");
+  } finally {
+    if (lavish) await lavish.close();
+    if (upstreamServer) await new Promise((resolve) => upstreamServer.close(resolve));
+    if (foreignServer) await new Promise((resolve) => foreignServer.close(resolve));
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

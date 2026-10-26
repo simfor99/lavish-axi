@@ -1289,7 +1289,9 @@ async function reloadArtifactPreservingDraft(explicit = false, options = {}) {
   reviewSwitchInFlight = true;
   let navigating = false;
   try {
-    const captured = await captureLatestReviewState();
+    const skipCapture =
+      !artifactLoadToken || Boolean(options.recoveryRetry && artifactSpokeToken !== artifactLoadToken);
+    const captured = skipCapture || (await captureLatestReviewState());
     if (!captured || (!explicit && hasUnsentDraft()) || lastReviewState?.attachmentsPending) {
       setChromeOutdated(true, "draft-revision");
       if (lastReviewState?.attachmentsPending && outdatedText) {
@@ -3293,8 +3295,8 @@ function setAccessCopyFeedback(hint, hintText, success) {
   const label = hint === copyLocalAccessHint ? "Local" : "Remote";
   if (status)
     status.textContent = success
-      ? `${label}-Adresse kopiert ✓`
-      : `${label}: Kopieren fehlgeschlagen. Adresse auswählen und manuell kopieren.`;
+      ? `${label} address copied ✓`
+      : `${label}: Copy failed. Select the address and copy it manually.`;
   clearTimeout(hint._accessTimer);
   if (success) {
     hint.classList.remove("copy-error");
@@ -4273,7 +4275,8 @@ async function reloadChromePreservingDraft(explicit, reason = "") {
   reviewSwitchInFlight = true;
   let navigating = false;
   try {
-    const captured = !artifactSrc || (await captureLatestReviewState());
+    const hasLoadedArtifact = Boolean(artifactSrc && artifactLoadToken);
+    const captured = !hasLoadedArtifact || (await captureLatestReviewState());
     const persisted = !lastReviewState || saveJsonState(reviewStateStorageKey, lastReviewState);
     if (
       !captured ||
