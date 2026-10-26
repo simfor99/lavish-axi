@@ -570,8 +570,8 @@ const REPLY_TOO_LARGE_HELP = "Shorten the reply, then retry `lavish-axi reply <h
 export async function replyCommand(args) {
   const file = firstPositionalArg(args, REPLY_VALUE_FLAGS);
   if (!file) {
-    throw new AxiError("HTML file path or URL is required", "VALIDATION_ERROR", [
-      'Run `lavish-axi reply <html-file|url> --agent-reply "<message>"`',
+    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", [
+      'Run `lavish-axi reply <html-file> --agent-reply "<message>"`',
     ]);
   }
   const inline = inspectValueFlag(args, "--agent-reply");
